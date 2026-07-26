@@ -1,0 +1,24 @@
+//! Core domain types for PromiseDB.
+//!
+//! The domain models capacity pools and atomic groups of time-bounded claims.
+//! Its constructors enforce the structural invariants required before an engine
+//! can evaluate availability.
+
+mod bundle;
+mod claim;
+mod error;
+mod interval;
+mod promise;
+mod resource_pool;
+
+pub use bundle::Bundle;
+pub use claim::Claim;
+pub use error::DomainError;
+pub use interval::Interval;
+pub use promise::{Promise, PromiseId, PromiseState, SequenceNumber, Version};
+pub use resource_pool::{ResourcePool, ResourcePoolId};
+/// An integer UTC timestamp.
+pub type Timestamp = i64;
+
+/// A non-negative amount of capacity expressed in a pool's unit.
+pub type Quantity = u64;
