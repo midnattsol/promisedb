@@ -1,8 +1,3 @@
-#![expect(
-    dead_code,
-    reason = "promise transitions will be used by the in-memory engine"
-)]
-
 //! Promise identity, state, and lifecycle transitions.
 
 use uuid::Uuid;
@@ -29,7 +24,7 @@ impl Version {
     /// # Errors
     ///
     /// Returns [`DomainError::VersionOverflow`] when this version is `u64::MAX`.
-    fn next(self) -> Result<Self, DomainError> {
+    pub(crate) fn next(self) -> Result<Self, DomainError> {
         self.0
             .checked_add(1)
             .map(Self)
@@ -54,6 +49,18 @@ impl SequenceNumber {
     pub fn get(self) -> u64 {
         self.0
     }
+
+    /// Returns the next global sequence number.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::SequenceOverflow`] when this sequence is `u64::MAX`.
+    pub(crate) fn next(self) -> Result<Self, DomainError> {
+        self.0
+            .checked_add(1)
+            .map(Self)
+            .ok_or(DomainError::SequenceOverflow)
+    }
 }
 
 /// The opaque identifier of a [`Promise`].
@@ -70,7 +77,10 @@ impl PromiseId {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PromiseState {
     /// A temporary reservation that must be committed before its deadline.
-    Held { expires_at: Timestamp },
+    Held {
+        /// The first timestamp at which the hold is considered expired.
+        expires_at: Timestamp,
+    },
     /// A confirmed commitment. Claim intervals still determine actual usage.
     Committed,
     /// A manually released promise that no longer consumes capacity.
@@ -149,7 +159,7 @@ impl Promise {
         self.version
     }
 
-    /// Commits a live hold.
+    /// Commits a live hold and returns its new version.
     ///
     /// # Errors
     ///
@@ -164,7 +174,7 @@ impl Promise {
         expected_version: Version,
         now: Timestamp,
         sequence: SequenceNumber,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Version, DomainError> {
         if expected_version != self.version {
             return Err(DomainError::VersionConflict);
         }
@@ -176,13 +186,13 @@ impl Promise {
                 self.version = next_version;
                 self.updated_sequence = sequence;
                 self.state = PromiseState::Committed;
-                Ok(())
+                Ok(next_version)
             }
             _ => Err(DomainError::InvalidPromiseState),
         }
     }
 
-    /// Releases a live hold or committed promise.
+    /// Releases a live hold or committed promise and returns its new version.
     ///
     /// # Errors
     ///
@@ -197,7 +207,7 @@ impl Promise {
         expected_version: Version,
         now: Timestamp,
         sequence: SequenceNumber,
-    ) -> Result<(), DomainError> {
+    ) -> Result<Version, DomainError> {
         if expected_version != self.version {
             return Err(DomainError::VersionConflict);
         }
@@ -209,7 +219,7 @@ impl Promise {
                 self.version = next_version;
                 self.updated_sequence = sequence;
                 self.state = PromiseState::Released;
-                Ok(())
+                Ok(next_version)
             }
             _ => Err(DomainError::InvalidPromiseState),
         }
@@ -304,10 +314,11 @@ mod tests {
     fn commits_a_live_hold() {
         let mut promise = held_promise();
 
-        promise
+        let new_version = promise
             .commit(Version(1), NOW, UPDATED_SEQUENCE)
             .expect("the live hold should commit");
 
+        assert_eq!(new_version, Version(2));
         assert_eq!(promise.state(), PromiseState::Committed);
         assert_eq!(promise.version().get(), 2);
         assert_eq!(promise.created_sequence(), CREATED_SEQUENCE);
@@ -379,10 +390,11 @@ mod tests {
     fn releases_a_live_hold() {
         let mut promise = held_promise();
 
-        promise
+        let new_version = promise
             .release(Version(1), NOW, UPDATED_SEQUENCE)
             .expect("the hold should release");
 
+        assert_eq!(new_version, Version(2));
         assert_eq!(promise.state(), PromiseState::Released);
         assert_eq!(promise.version().get(), 2);
         assert_eq!(promise.updated_sequence(), UPDATED_SEQUENCE);

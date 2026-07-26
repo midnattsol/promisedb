@@ -35,6 +35,16 @@ impl Interval {
     pub fn end(&self) -> Timestamp {
         self.end
     }
+
+    /// Returns whether `timestamp` belongs to this half-open interval.
+    pub fn contains(&self, timestamp: Timestamp) -> bool {
+        timestamp >= self.start && timestamp < self.end
+    }
+
+    /// Returns whether this interval overlaps another half-open interval.
+    pub fn overlaps(&self, other: &Self) -> bool {
+        self.start < other.end && other.start < self.end
+    }
 }
 
 #[cfg(test)]
@@ -57,5 +67,39 @@ mod tests {
     #[test]
     fn rejects_a_reversed_interval() {
         assert_eq!(Interval::new(20, 10), Err(DomainError::InvalidInterval));
+    }
+
+    #[test]
+    fn adjacent_intervals_do_not_overlap() {
+        let left = Interval::new(0, 10).expect("the interval should be valid");
+        let right = Interval::new(10, 20).expect("the interval should be valid");
+
+        assert!(!left.overlaps(&right));
+        assert!(!right.overlaps(&left));
+    }
+
+    #[test]
+    fn intersecting_intervals_overlap() {
+        let left = Interval::new(0, 11).expect("the interval should be valid");
+        let right = Interval::new(10, 20).expect("the interval should be valid");
+
+        assert!(left.overlaps(&right));
+        assert!(right.overlaps(&left));
+    }
+
+    #[test]
+    fn identical_intervals_overlap() {
+        let interval = Interval::new(0, 10).expect("the interval should be valid");
+
+        assert!(interval.overlaps(&interval));
+    }
+
+    #[test]
+    fn containing_intervals_overlap() {
+        let outer = Interval::new(0, 20).expect("the interval should be valid");
+        let inner = Interval::new(5, 10).expect("the interval should be valid");
+
+        assert!(outer.overlaps(&inner));
+        assert!(inner.overlaps(&outer));
     }
 }

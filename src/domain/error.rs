@@ -3,23 +3,37 @@
 use std::error::Error;
 use std::fmt::{self, Display, Formatter};
 
-/// An error caused by invalid PromiseDB domain data.
+/// An error raised while validating data or applying a PromiseDB transition.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DomainError {
     /// An interval has an end that is not greater than its start.
     InvalidInterval,
     /// A claim or resource pool has a zero quantity.
     InvalidQuantity,
+    /// Capacity or usage arithmetic overflowed.
+    QuantityOverflow,
     /// A hold expiration deadline is not in the future.
     InvalidExpiration,
     /// A bundle contains no claims.
     EmptyBundle,
+    /// A resource pool already exists with the same identifier.
+    ResourcePoolAlreadyExists,
+    /// A referenced resource pool does not exist.
+    ResourcePoolNotFound,
+    /// A claim bundle would exceed a resource pool's available capacity.
+    CapacityExceeded,
+    /// A referenced promise does not exist.
+    PromiseNotFound,
     /// An operation is not allowed from the promise's current state.
     InvalidPromiseState,
     /// The expected promise version does not match its current version.
     VersionConflict,
     /// A promise version cannot be incremented without overflowing.
     VersionOverflow,
+    /// The global sequence number cannot be incremented without overflowing.
+    SequenceOverflow,
+    /// The system clock cannot be represented as a PromiseDB timestamp.
+    SystemTimeOutOfRange,
     /// A held promise has reached its expiration deadline.
     HoldExpired,
     /// A held promise has not reached its expiration deadline yet.
@@ -31,11 +45,22 @@ impl Display for DomainError {
         let message = match self {
             Self::InvalidInterval => "interval start must be less than its end",
             Self::InvalidQuantity => "quantity must be greater than zero",
+            Self::QuantityOverflow => "capacity or usage arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",
             Self::EmptyBundle => "bundle must contain at least one claim",
+            Self::ResourcePoolAlreadyExists => {
+                "resource pool already exists with the same identifier"
+            }
+            Self::ResourcePoolNotFound => "resource pool does not exist",
+            Self::CapacityExceeded => "claim bundle exceeds available resource pool capacity",
+            Self::PromiseNotFound => "promise does not exist",
             Self::InvalidPromiseState => "operation is not allowed from the current promise state",
             Self::VersionConflict => "expected promise version does not match the current version",
             Self::VersionOverflow => "promise version cannot be incremented",
+            Self::SequenceOverflow => "global sequence number cannot be incremented",
+            Self::SystemTimeOutOfRange => {
+                "system clock cannot be represented as a PromiseDB timestamp"
+            }
             Self::HoldExpired => "held promise has expired",
             Self::HoldNotExpired => "held promise has not expired yet",
         };

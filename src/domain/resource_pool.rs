@@ -38,12 +38,25 @@ impl ResourcePool {
         unit: String,
         capacity: Quantity,
     ) -> Result<Self, DomainError> {
+        Self::with_id(ResourcePoolId::generate(), display_name, unit, capacity)
+    }
+
+    /// Creates a resource pool with an engine-provided identifier.
+    ///
+    /// This constructor lets deterministic transitions and replay preserve the
+    /// identifier chosen when the resource pool was originally created.
+    pub(crate) fn with_id(
+        id: ResourcePoolId,
+        display_name: String,
+        unit: String,
+        capacity: Quantity,
+    ) -> Result<Self, DomainError> {
         if capacity == 0 {
             return Err(DomainError::InvalidQuantity);
         }
 
         Ok(Self {
-            id: ResourcePoolId::generate(),
+            id,
             display_name,
             unit,
             capacity,
