@@ -16,6 +16,8 @@ pub enum DomainError {
     InvalidQuantity,
     /// Capacity or usage arithmetic overflowed.
     QuantityOverflow,
+    /// A derived index value cannot be represented without overflowing.
+    IndexOverflow,
     /// A hold expiration deadline is not in the future.
     InvalidExpiration,
     /// A bundle contains no claims.
@@ -52,6 +54,7 @@ impl Display for DomainError {
             Self::OverlappingCapacitySegments => "capacity segments must not overlap",
             Self::InvalidQuantity => "quantity must be greater than zero",
             Self::QuantityOverflow => "capacity or usage arithmetic overflowed",
+            Self::IndexOverflow => "derived index arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",
             Self::EmptyBundle => "bundle must contain at least one claim",
             Self::ResourcePoolAlreadyExists => {
