@@ -8,6 +8,10 @@ use std::fmt::{self, Display, Formatter};
 pub enum DomainError {
     /// An interval has an end that is not greater than its start.
     InvalidInterval,
+    /// Capacity segments expected in chronological order are out of order.
+    UnsortedCapacitySegments,
+    /// Two capacity segments overlap in time.
+    OverlappingCapacitySegments,
     /// A claim or resource pool has a zero quantity.
     InvalidQuantity,
     /// Capacity or usage arithmetic overflowed.
@@ -44,6 +48,8 @@ impl Display for DomainError {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> fmt::Result {
         let message = match self {
             Self::InvalidInterval => "interval start must be less than its end",
+            Self::UnsortedCapacitySegments => "capacity segments must be chronologically ordered",
+            Self::OverlappingCapacitySegments => "capacity segments must not overlap",
             Self::InvalidQuantity => "quantity must be greater than zero",
             Self::QuantityOverflow => "capacity or usage arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",

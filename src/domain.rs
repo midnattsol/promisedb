@@ -5,6 +5,7 @@
 //! can evaluate availability.
 
 mod bundle;
+mod capacity_curve;
 mod claim;
 mod error;
 mod interval;
@@ -12,6 +13,7 @@ mod promise;
 mod resource_pool;
 
 pub use bundle::Bundle;
+pub use capacity_curve::{CapacityCurve, CapacitySegment};
 pub use claim::Claim;
 pub use error::DomainError;
 pub use interval::Interval;

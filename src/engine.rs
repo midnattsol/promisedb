@@ -335,7 +335,7 @@ impl Engine {
 
     /// Checks all candidate claims for one pool as a single hypothetical change.
     ///
-    /// The timeline is divided at every relevant claim boundary. Existing and
+    /// The timeline is divided at every relevant claim boundary. Active and
     /// candidate usage is recomputed for each resulting half-open segment using
     /// checked arithmetic.
     fn check_pool_availability(
@@ -348,11 +348,11 @@ impl Engine {
             .get(&pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?;
 
-        let mut reserved_claims: Vec<&Claim> = Vec::new();
+        let mut active_claims: Vec<&Claim> = Vec::new();
         let mut breakpoints = Vec::new();
 
-        for candidate in candidate_claims {
-            let interval = candidate.interval();
+        for candidate_claim in candidate_claims {
+            let interval = candidate_claim.interval();
             breakpoints.push(interval.start());
             breakpoints.push(interval.end());
         }
@@ -365,22 +365,22 @@ impl Engine {
                 continue;
             }
 
-            for reserved_claim in promise.bundle().claims() {
-                if reserved_claim.pool_id() != pool_id {
+            for active_claim in promise.bundle().claims() {
+                if active_claim.pool_id() != pool_id {
                     continue;
                 }
 
-                let reserved_interval = reserved_claim.interval();
+                let active_interval = active_claim.interval();
                 if !candidate_claims
                     .iter()
-                    .any(|candidate| reserved_interval.overlaps(&candidate.interval()))
+                    .any(|candidate_claim| active_interval.overlaps(&candidate_claim.interval()))
                 {
                     continue;
                 }
 
-                reserved_claims.push(reserved_claim);
-                breakpoints.push(reserved_interval.start());
-                breakpoints.push(reserved_interval.end());
+                active_claims.push(active_claim);
+                breakpoints.push(active_interval.start());
+                breakpoints.push(active_interval.end());
             }
         }
 
@@ -389,21 +389,21 @@ impl Engine {
 
         for segment in breakpoints.windows(2) {
             let segment_start = segment[0];
-            let mut existing_usage: Quantity = 0;
+            let mut active_usage: Quantity = 0;
             let mut candidate_usage: Quantity = 0;
 
-            for reserved_claim in &reserved_claims {
-                if reserved_claim.interval().contains(segment_start) {
-                    existing_usage = existing_usage
-                        .checked_add(reserved_claim.quantity())
+            for active_claim in &active_claims {
+                if active_claim.interval().contains(segment_start) {
+                    active_usage = active_usage
+                        .checked_add(active_claim.quantity())
                         .ok_or(DomainError::QuantityOverflow)?;
                 }
             }
 
-            for candidate in candidate_claims {
-                if candidate.interval().contains(segment_start) {
+            for candidate_claim in candidate_claims {
+                if candidate_claim.interval().contains(segment_start) {
                     candidate_usage = candidate_usage
-                        .checked_add(candidate.quantity())
+                        .checked_add(candidate_claim.quantity())
                         .ok_or(DomainError::QuantityOverflow)?;
                 }
             }
@@ -412,11 +412,11 @@ impl Engine {
                 continue;
             }
 
-            let final_usage = existing_usage
+            let final_usage = active_usage
                 .checked_add(candidate_usage)
                 .ok_or(DomainError::QuantityOverflow)?;
 
-            if final_usage > pool.capacity() {
+            if final_usage > pool.capacity_at(segment_start) {
                 return Ok(false);
             }
         }
@@ -505,7 +505,7 @@ mod tests {
         assert_eq!(created_id, pool_id);
         assert_eq!(pool.display_name(), "Machine pool");
         assert_eq!(pool.unit(), "machines");
-        assert_eq!(pool.capacity(), 10);
+        assert_eq!(pool.capacity_at(NOW), 10);
         assert_eq!(engine.sequence().get(), 1);
     }
 
@@ -544,7 +544,7 @@ mod tests {
             .expect("the original resource pool should remain");
         assert_eq!(pool.display_name(), "Original");
         assert_eq!(pool.unit(), "machines");
-        assert_eq!(pool.capacity(), 10);
+        assert_eq!(pool.capacity_at(NOW), 10);
         assert_eq!(engine.sequence().get(), 1);
     }
 
