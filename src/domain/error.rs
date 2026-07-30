@@ -12,7 +12,7 @@ pub enum DomainError {
     UnsortedCapacitySegments,
     /// Two capacity segments overlap in time.
     OverlappingCapacitySegments,
-    /// A claim or resource pool has a zero quantity.
+    /// A claim has a zero quantity.
     InvalidQuantity,
     /// Capacity or usage arithmetic overflowed.
     QuantityOverflow,

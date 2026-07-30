@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use super::{CapacityCurve, CapacitySegment, DomainError, Interval, Quantity, Timestamp};
+use super::{CapacityCurve, Quantity, Timestamp};
 
 /// The opaque identifier of a [`ResourcePool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -29,25 +29,8 @@ pub struct ResourcePool {
 
 impl ResourcePool {
     /// Creates a resource pool with a generated identifier.
-    ///
-    /// # Errors
-    ///
-    /// Returns [`DomainError::InvalidQuantity`] when `capacity` is zero.
-    pub fn new(
-        display_name: String,
-        unit: String,
-        capacity: Quantity,
-    ) -> Result<Self, DomainError> {
-        Self::with_id(ResourcePoolId::generate(), display_name, unit, capacity)
-    }
-
-    /// Creates a resource pool with a generated identifier and capacity curve.
-    pub fn with_capacity_curve(
-        display_name: String,
-        unit: String,
-        capacity_curve: CapacityCurve,
-    ) -> Self {
-        Self::with_id_and_capacity_curve(
+    pub fn new(display_name: String, unit: String, capacity_curve: CapacityCurve) -> Self {
+        Self::with_id(
             ResourcePoolId::generate(),
             display_name,
             unit,
@@ -60,29 +43,6 @@ impl ResourcePool {
     /// This constructor lets deterministic transitions and replay preserve the
     /// identifier chosen when the resource pool was originally created.
     pub(crate) fn with_id(
-        id: ResourcePoolId,
-        display_name: String,
-        unit: String,
-        capacity: Quantity,
-    ) -> Result<Self, DomainError> {
-        if capacity == 0 {
-            return Err(DomainError::InvalidQuantity);
-        }
-
-        let interval = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
-        let capacity_curve =
-            CapacityCurve::from_sorted(vec![CapacitySegment::new(interval, capacity)])?;
-
-        Ok(Self::with_id_and_capacity_curve(
-            id,
-            display_name,
-            unit,
-            capacity_curve,
-        ))
-    }
-
-    /// Creates a resource pool with an engine-provided ID and validated curve.
-    pub(crate) fn with_id_and_capacity_curve(
         id: ResourcePoolId,
         display_name: String,
         unit: String,
@@ -125,11 +85,22 @@ impl ResourcePool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::domain::{CapacitySegment, Interval};
+
+    fn constant_capacity_curve(capacity: Quantity) -> CapacityCurve {
+        let interval = Interval::new(Timestamp::MIN, Timestamp::MAX)
+            .expect("the constant-capacity interval should be valid");
+        CapacityCurve::from_sorted(vec![CapacitySegment::new(interval, capacity)])
+            .expect("the constant capacity curve should be valid")
+    }
 
     #[test]
     fn creates_a_resource_pool() {
-        let pool = ResourcePool::new("Main machine pool".into(), "machines".into(), 10)
-            .expect("the resource pool should be valid");
+        let pool = ResourcePool::new(
+            "Main machine pool".into(),
+            "machines".into(),
+            constant_capacity_curve(10),
+        );
 
         assert!(!pool.id().0.is_nil());
         assert_eq!(pool.display_name(), "Main machine pool");
@@ -150,11 +121,7 @@ mod tests {
             ),
         ])
         .expect("the capacity curve should be valid");
-        let pool = ResourcePool::with_capacity_curve(
-            "Variable machine pool".into(),
-            "machines".into(),
-            curve,
-        );
+        let pool = ResourcePool::new("Variable machine pool".into(), "machines".into(), curve);
 
         assert_eq!(pool.capacity_at(-1), 0);
         assert_eq!(pool.capacity_at(50), 10);
@@ -164,9 +131,13 @@ mod tests {
     }
 
     #[test]
-    fn rejects_zero_capacity() {
-        let result = ResourcePool::new("Unavailable pool".into(), "machines".into(), 0);
+    fn accepts_an_empty_capacity_curve() {
+        let pool = ResourcePool::new(
+            "Unavailable pool".into(),
+            "machines".into(),
+            CapacityCurve::empty(),
+        );
 
-        assert_eq!(result, Err(DomainError::InvalidQuantity));
+        assert_eq!(pool.capacity_at(0), 0);
     }
 }

@@ -20,7 +20,7 @@ The domain owns structural invariants for intervals, claims, bundles, promises, 
 
 ### Engine
 
-`Engine` owns resource pools, promises, and the global sequence number. Public operations read the injected clock once and delegate to deterministic `*_at` transitions.
+`Engine` owns resource pools, promises, the global sequence number, and one derived `SlackTimeline` per pool. Public operations read the injected clock once and delegate to deterministic `*_at` transitions.
 
 ```text
 public operation
@@ -28,8 +28,9 @@ public operation
 → deterministic transition with explicit now
 → process due expirations
 → validate the complete operation
+→ prepare affected timeline copies
 → calculate the next sequence
-→ apply state changes
+→ publish authoritative state and prepared indexes
 → publish the sequence and result
 ```
 
@@ -41,7 +42,11 @@ Indexes accelerate decisions but are not authoritative. `SlackTimeline` is deriv
 
 The index uses chronologically ordered slack points grouped into bounded blocks. Blocks maintain minimum and maximum effective slack plus a lazy block-wide delta. Complete blocks can be queried or adjusted without visiting each point.
 
-`SlackTimeline` is implemented and tested in isolation. The engine still uses its reference availability calculation; index integration is a separate step.
+The engine creates a timeline with each resource pool and keeps it synchronized with promise transitions. A hold consumes slack, while release and expiration restore it. Commit does not adjust slack because both held and committed promises consume the same capacity.
+
+Timeline changes are first applied to copies of every affected pool's index. The engine publishes those copies only after the complete bundle succeeds, preventing partial index updates across pools.
+
+Hold admission still runs the reference availability calculation before preparing indexed changes. The reference path is retained while differential tests establish that both implementations agree; the index is not yet the sole production admission path.
 
 ## Authoritative state
 

@@ -1,5 +1,7 @@
 use promisedb::clock::{Clock, SystemClock};
-use promisedb::domain::{Bundle, Claim, DomainError, Interval, PromiseId, Timestamp};
+use promisedb::domain::{
+    Bundle, CapacityCurve, CapacitySegment, Claim, DomainError, Interval, PromiseId, Timestamp,
+};
 use promisedb::engine::Engine;
 use std::error::Error;
 use std::io;
@@ -33,7 +35,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     let mut engine = Engine::new();
     let now = SystemClock.now()?;
 
-    let pool_id = engine.create_resource_pool("Assembly machines".into(), "machines".into(), 2)?;
+    let capacity_interval = Interval::new(Timestamp::MIN, Timestamp::MAX)?;
+    let capacity_curve =
+        CapacityCurve::from_sorted(vec![CapacitySegment::new(capacity_interval, 2)])?;
+    let pool_id = engine.create_resource_pool(
+        "Assembly machines".into(),
+        "machines".into(),
+        capacity_curve,
+    )?;
     println!(
         "resource pool created: id={pool_id:?}, sequence={}",
         engine.sequence().get()

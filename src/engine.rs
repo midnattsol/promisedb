@@ -7,8 +7,8 @@
 use crate::clock::{Clock, SystemClock};
 use crate::domain::DomainError;
 use crate::domain::{
-    Bundle, Claim, Promise, PromiseId, PromiseState, Quantity, ResourcePool, ResourcePoolId,
-    SequenceNumber, Timestamp, Version,
+    Bundle, CapacityCurve, Claim, Promise, PromiseId, PromiseState, Quantity, ResourcePool,
+    ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
@@ -141,13 +141,13 @@ impl Engine {
     /// # Errors
     ///
     /// Returns an error when expiration processing fails, the ID already exists,
-    /// the capacity is invalid, or the global sequence overflows.
+    /// index construction fails, or the global sequence overflows.
     pub(crate) fn create_resource_pool_at(
         &mut self,
         pool_id: ResourcePoolId,
         display_name: String,
         unit: String,
-        capacity: Quantity,
+        capacity_curve: CapacityCurve,
         now: Timestamp,
     ) -> Result<ResourcePoolId, DomainError> {
         self.process_expirations(now)?;
@@ -156,7 +156,7 @@ impl Engine {
             return Err(DomainError::ResourcePoolAlreadyExists);
         }
 
-        let pool = ResourcePool::with_id(pool_id, display_name, unit, capacity)?;
+        let pool = ResourcePool::with_id(pool_id, display_name, unit, capacity_curve);
         let slack_timeline = SlackTimeline::from_capacity_curve(pool.capacity_curve())
             .map_err(|_| DomainError::IndexOverflow)?;
         let next_sequence = self.next_sequence()?;
@@ -173,16 +173,16 @@ impl Engine {
     /// # Errors
     ///
     /// Returns an error when the clock cannot provide a timestamp, expiration
-    /// processing fails, the capacity is invalid, or the sequence overflows.
+    /// processing or index construction fails, or the sequence overflows.
     pub fn create_resource_pool(
         &mut self,
         display_name: String,
         unit: String,
-        capacity: Quantity,
+        capacity_curve: CapacityCurve,
     ) -> Result<ResourcePoolId, DomainError> {
         let now = self.clock.now()?;
         let pool_id = ResourcePoolId::generate();
-        self.create_resource_pool_at(pool_id, display_name, unit, capacity, now)
+        self.create_resource_pool_at(pool_id, display_name, unit, capacity_curve, now)
     }
 
     /// Atomically holds a bundle using an authoritative timestamp.
@@ -554,7 +554,7 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::Interval;
+    use crate::domain::{CapacitySegment, Interval};
 
     const NOW: Timestamp = 0;
     const EXPIRES_AT: Timestamp = 1_000;
@@ -568,10 +568,20 @@ mod tests {
         }
     }
 
+    fn constant_capacity_curve(capacity: Quantity) -> CapacityCurve {
+        let interval = Interval::new(Timestamp::MIN, Timestamp::MAX)
+            .expect("the constant-capacity interval should be valid");
+        CapacityCurve::from_sorted(vec![CapacitySegment::new(interval, capacity)])
+            .expect("the constant capacity curve should be valid")
+    }
+
     fn engine_with_pool(capacity: Quantity) -> (Engine, ResourcePoolId) {
         let mut engine = Engine::new();
-        let pool = ResourcePool::new("Test pool".into(), "units".into(), capacity)
-            .expect("the pool should be valid");
+        let pool = ResourcePool::new(
+            "Test pool".into(),
+            "units".into(),
+            constant_capacity_curve(capacity),
+        );
         let pool_id = pool.id();
         let timeline = SlackTimeline::from_capacity_curve(pool.capacity_curve())
             .expect("the slack timeline should be created");
@@ -623,7 +633,13 @@ mod tests {
         let pool_id = ResourcePoolId::generate();
 
         let created_id = engine
-            .create_resource_pool_at(pool_id, "Machine pool".into(), "machines".into(), 10, NOW)
+            .create_resource_pool_at(
+                pool_id,
+                "Machine pool".into(),
+                "machines".into(),
+                constant_capacity_curve(10),
+                NOW,
+            )
             .expect("the resource pool should be created");
 
         let pool = engine
@@ -649,22 +665,36 @@ mod tests {
     }
 
     #[test]
-    fn invalid_resource_pool_does_not_consume_a_sequence() {
+    fn an_empty_capacity_curve_creates_a_pool_with_zero_slack() {
         let mut engine = Engine::with_clock(FixedClock(NOW));
         let pool_id = ResourcePoolId::generate();
 
-        let result = engine.create_resource_pool_at(
-            pool_id,
-            "Unavailable pool".into(),
-            "machines".into(),
-            0,
-            NOW,
-        );
+        let created_id = engine
+            .create_resource_pool_at(
+                pool_id,
+                "Unavailable pool".into(),
+                "machines".into(),
+                CapacityCurve::empty(),
+                NOW,
+            )
+            .expect("zero capacity should be valid");
 
-        assert_eq!(result, Err(DomainError::InvalidQuantity));
-        assert!(engine.resource_pool(pool_id).is_none());
-        assert!(engine.slack_timeline(pool_id).is_none());
-        assert_eq!(engine.sequence().get(), 0);
+        assert_eq!(created_id, pool_id);
+        assert_eq!(
+            engine
+                .resource_pool(pool_id)
+                .expect("the resource pool should exist")
+                .capacity_at(NOW),
+            0
+        );
+        assert_eq!(
+            engine
+                .slack_timeline(pool_id)
+                .expect("the timeline should exist")
+                .slack_at(NOW),
+            Ok(0)
+        );
+        assert_eq!(engine.sequence().get(), 1);
     }
 
     #[test]
@@ -672,11 +702,22 @@ mod tests {
         let mut engine = Engine::with_clock(FixedClock(NOW));
         let pool_id = ResourcePoolId::generate();
         engine
-            .create_resource_pool_at(pool_id, "Original".into(), "machines".into(), 10, NOW)
+            .create_resource_pool_at(
+                pool_id,
+                "Original".into(),
+                "machines".into(),
+                constant_capacity_curve(10),
+                NOW,
+            )
             .expect("the first resource pool should be created");
 
-        let result =
-            engine.create_resource_pool_at(pool_id, "Replacement".into(), "people".into(), 20, NOW);
+        let result = engine.create_resource_pool_at(
+            pool_id,
+            "Replacement".into(),
+            "people".into(),
+            constant_capacity_curve(20),
+            NOW,
+        );
 
         assert_eq!(result, Err(DomainError::ResourcePoolAlreadyExists));
         let pool = engine
