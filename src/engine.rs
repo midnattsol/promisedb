@@ -4,22 +4,33 @@
 //! It evaluates bundles against active held and committed claims without storing
 //! a second authoritative usage counter.
 
+mod availability;
+
+pub use availability::{AvailabilityConflict, HoldOutcome};
+
 use crate::clock::{Clock, SystemClock};
 use crate::domain::DomainError;
 use crate::domain::{
-    Bundle, CapacityCurve, Claim, Promise, PromiseId, PromiseState, Quantity, ResourcePool,
-    ResourcePoolId, SequenceNumber, Timestamp, Version,
+    Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
+    ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
 
-/// The direction of a derived timeline adjustment.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum TimelineAdjustment {
-    /// Consumes slack when a promise becomes active.
-    Consume,
-    /// Restores slack when a promise stops being active.
-    Restore,
+/// The result of evaluating candidate claims against one resource pool.
+enum PoolAdmission {
+    /// Every claim fits and the returned timeline contains their consumption.
+    Available(SlackTimeline),
+    /// The claims do not fit in one or more intervals.
+    Unavailable(Vec<AvailabilityConflict>),
+}
+
+/// The result of evaluating every resource pool referenced by one bundle.
+enum BundleAdmission {
+    /// Every pool fits and the returned timelines are ready to publish.
+    Available(BTreeMap<ResourcePoolId, SlackTimeline>),
+    /// The bundle does not fit and no timeline may be published.
+    Unavailable(Vec<AvailabilityConflict>),
 }
 
 /// The single-node state machine for PromiseDB.
@@ -120,8 +131,7 @@ impl Engine {
                 .clone();
 
             expired_promise.expire(now, next_sequence)?;
-            let adjusted_timelines =
-                self.adjusted_timelines(expired_promise.bundle(), TimelineAdjustment::Restore)?;
+            let adjusted_timelines = self.restored_timelines(expired_promise.bundle())?;
 
             self.promises.insert(promise_id, expired_promise);
             self.slack_timelines.extend(adjusted_timelines);
@@ -194,24 +204,26 @@ impl Engine {
     /// # Errors
     ///
     /// Returns an error for an invalid deadline, a missing pool, arithmetic
-    /// overflow, unavailable capacity, or sequence exhaustion.
+    /// overflow, or sequence exhaustion. Insufficient capacity is returned as
+    /// [`HoldOutcome::Unavailable`].
     pub(crate) fn hold_at(
         &mut self,
         bundle: Bundle,
         expires_at: Timestamp,
         now: Timestamp,
-    ) -> Result<PromiseId, DomainError> {
+    ) -> Result<HoldOutcome, DomainError> {
         self.process_expirations(now)?;
 
         if expires_at <= now {
             return Err(DomainError::InvalidExpiration);
         }
 
-        if !self.check_availability(&bundle)? {
-            return Err(DomainError::CapacityExceeded);
-        }
-
-        let adjusted_timelines = self.adjusted_timelines(&bundle, TimelineAdjustment::Consume)?;
+        let adjusted_timelines = match self.evaluate_bundle_admission(&bundle)? {
+            BundleAdmission::Available(timelines) => timelines,
+            BundleAdmission::Unavailable(conflicts) => {
+                return Ok(HoldOutcome::Unavailable { conflicts });
+            }
+        };
         let next_sequence = self.next_sequence()?;
         let promise = Promise::new(bundle, expires_at, now, next_sequence)?;
         let promise_id = promise.id();
@@ -220,7 +232,7 @@ impl Engine {
         self.slack_timelines.extend(adjusted_timelines);
         self.sequence = next_sequence;
 
-        Ok(promise_id)
+        Ok(HoldOutcome::Held(promise_id))
     }
 
     /// Atomically holds a bundle using one timestamp read from the engine's clock.
@@ -230,13 +242,14 @@ impl Engine {
     ///
     /// # Errors
     ///
-    /// Returns an error when the clock cannot provide a timestamp or when the
-    /// bundle fails validation or admission.
+    /// Returns an error when the clock cannot provide a timestamp or the bundle
+    /// cannot be evaluated safely. Insufficient capacity is a normal
+    /// [`HoldOutcome::Unavailable`] result.
     pub fn hold(
         &mut self,
         bundle: Bundle,
         expires_at: Timestamp,
-    ) -> Result<PromiseId, DomainError> {
+    ) -> Result<HoldOutcome, DomainError> {
         let now = self.clock.now()?;
         self.hold_at(bundle, expires_at, now)
     }
@@ -319,8 +332,7 @@ impl Engine {
         }
 
         let new_version = released_promise.release(expected_version, now, new_sequence)?;
-        let adjusted_timelines =
-            self.adjusted_timelines(released_promise.bundle(), TimelineAdjustment::Restore)?;
+        let adjusted_timelines = self.restored_timelines(released_promise.bundle())?;
 
         self.promises.insert(promise_id, released_promise);
         self.slack_timelines.extend(adjusted_timelines);
@@ -349,6 +361,7 @@ impl Engine {
     /// Claims are grouped by pool so overlapping candidate claims are evaluated
     /// together. Due hold expirations must be processed before calling this
     /// function.
+    #[cfg(test)]
     fn check_availability(&self, bundle: &Bundle) -> Result<bool, DomainError> {
         let mut claims_by_pool: BTreeMap<ResourcePoolId, Vec<&Claim>> = BTreeMap::new();
 
@@ -373,6 +386,7 @@ impl Engine {
     /// The timeline is divided at every relevant claim boundary. Active and
     /// candidate usage is recomputed for each resulting half-open segment using
     /// checked arithmetic.
+    #[cfg(test)]
     fn check_pool_availability(
         &self,
         pool_id: ResourcePoolId,
@@ -388,6 +402,12 @@ impl Engine {
 
         for candidate_claim in candidate_claims {
             let interval = candidate_claim.interval();
+            breakpoints.push(interval.start());
+            breakpoints.push(interval.end());
+        }
+
+        for capacity_segment in pool.capacity_curve().segments() {
+            let interval = capacity_segment.interval();
             breakpoints.push(interval.start());
             breakpoints.push(interval.end());
         }
@@ -459,13 +479,128 @@ impl Engine {
         Ok(true)
     }
 
-    fn adjusted_timelines(
+    fn evaluate_pool_admission(
         &self,
-        bundle: &Bundle,
-        adjustment: TimelineAdjustment,
-    ) -> Result<BTreeMap<ResourcePoolId, SlackTimeline>, DomainError> {
-        let mut claims_by_pool: BTreeMap<ResourcePoolId, Vec<&Claim>> = BTreeMap::new();
+        pool_id: ResourcePoolId,
+        candidate_claims: &[&Claim],
+    ) -> Result<PoolAdmission, DomainError> {
+        let mut slack_timeline = self
+            .slack_timeline(pool_id)
+            .ok_or(DomainError::ResourcePoolNotFound)?
+            .clone();
+        let mut demand_events: Vec<(Timestamp, i128)> = Vec::new();
 
+        for claim in candidate_claims {
+            let interval = claim.interval();
+            let quantity = i128::from(claim.quantity());
+            demand_events.push((interval.start(), quantity));
+            demand_events.push((interval.end(), -quantity));
+        }
+
+        for point in slack_timeline
+            .effective_points()
+            .map_err(|_| DomainError::IndexOverflow)?
+        {
+            if candidate_claims
+                .iter()
+                .any(|claim| claim.interval().contains(point.timestamp()))
+            {
+                demand_events.push((point.timestamp(), 0));
+            }
+        }
+
+        demand_events.sort_unstable_by_key(|event| event.0);
+        let mut normalized_events: Vec<(Timestamp, i128)> = Vec::new();
+
+        for (timestamp, delta) in demand_events {
+            if let Some((last_timestamp, last_delta)) = normalized_events.last_mut()
+                && *last_timestamp == timestamp
+            {
+                *last_delta = last_delta
+                    .checked_add(delta)
+                    .ok_or(DomainError::QuantityOverflow)?;
+                continue;
+            }
+
+            normalized_events.push((timestamp, delta));
+        }
+
+        let mut conflicts: Vec<AvailabilityConflict> = Vec::new();
+        let mut current_demand: i128 = 0;
+
+        for window in normalized_events.windows(2) {
+            current_demand = current_demand
+                .checked_add(window[0].1)
+                .ok_or(DomainError::QuantityOverflow)?;
+            let required_quantity =
+                Quantity::try_from(current_demand).map_err(|_| DomainError::QuantityOverflow)?;
+            if required_quantity == 0 {
+                continue;
+            }
+
+            let interval = Interval::new(window[0].0, window[1].0)?;
+            let slack = slack_timeline
+                .slack_at(interval.start())
+                .map_err(|_| DomainError::IndexOverflow)?;
+            let available_quantity = if slack <= 0 {
+                0
+            } else {
+                Quantity::try_from(slack).map_err(|_| DomainError::IndexOverflow)?
+            };
+
+            if required_quantity > available_quantity {
+                let conflicting_promise_ids = self
+                    .promises
+                    .iter()
+                    .filter_map(|(promise_id, promise)| {
+                        let active = matches!(
+                            promise.state(),
+                            PromiseState::Held { .. } | PromiseState::Committed
+                        );
+                        let overlaps = promise.bundle().claims().iter().any(|claim| {
+                            claim.pool_id() == pool_id && claim.interval().overlaps(&interval)
+                        });
+                        (active && overlaps).then_some(*promise_id)
+                    })
+                    .collect();
+                let conflict = AvailabilityConflict {
+                    resource_pool_id: pool_id,
+                    blocking_interval: interval,
+                    required_quantity,
+                    available_quantity,
+                    deficit_quantity: required_quantity - available_quantity,
+                    conflicting_promise_ids,
+                };
+
+                if let Some(previous) = conflicts.last_mut()
+                    && previous.blocking_interval.end() == interval.start()
+                    && previous.required_quantity == conflict.required_quantity
+                    && previous.available_quantity == conflict.available_quantity
+                    && previous.deficit_quantity == conflict.deficit_quantity
+                    && previous.conflicting_promise_ids == conflict.conflicting_promise_ids
+                {
+                    previous.blocking_interval =
+                        Interval::new(previous.blocking_interval.start(), interval.end())?;
+                } else {
+                    conflicts.push(conflict);
+                }
+            }
+
+            slack_timeline
+                .apply_delta(interval, -current_demand)
+                .map_err(|_| DomainError::IndexOverflow)?;
+        }
+
+        if conflicts.is_empty() {
+            Ok(PoolAdmission::Available(slack_timeline))
+        } else {
+            Ok(PoolAdmission::Unavailable(conflicts))
+        }
+    }
+
+    /// Evaluates every pool in a bundle without mutating engine state.
+    fn evaluate_bundle_admission(&self, bundle: &Bundle) -> Result<BundleAdmission, DomainError> {
+        let mut claims_by_pool: BTreeMap<ResourcePoolId, Vec<&Claim>> = BTreeMap::new();
         for claim in bundle.claims() {
             claims_by_pool
                 .entry(claim.pool_id())
@@ -474,74 +609,64 @@ impl Engine {
         }
 
         let mut adjusted_timelines = BTreeMap::new();
+        let mut conflicts = Vec::new();
+        for (pool_id, claims) in claims_by_pool {
+            match self.evaluate_pool_admission(pool_id, &claims)? {
+                PoolAdmission::Available(timeline) => {
+                    adjusted_timelines.insert(pool_id, timeline);
+                }
+                PoolAdmission::Unavailable(pool_conflicts) => {
+                    conflicts.extend(pool_conflicts);
+                }
+            }
+        }
 
+        if conflicts.is_empty() {
+            Ok(BundleAdmission::Available(adjusted_timelines))
+        } else {
+            conflicts.sort_unstable_by_key(|conflict| {
+                (
+                    conflict.blocking_interval().start(),
+                    conflict.resource_pool_id(),
+                    conflict.blocking_interval().end(),
+                )
+            });
+            Ok(BundleAdmission::Unavailable(conflicts))
+        }
+    }
+
+    /// Prepares timeline copies after active bundle usage is removed.
+    ///
+    /// This method never mutates engine state. Its returned map may be published
+    /// only after the corresponding release or expiration transition succeeds.
+    fn restored_timelines(
+        &self,
+        bundle: &Bundle,
+    ) -> Result<BTreeMap<ResourcePoolId, SlackTimeline>, DomainError> {
+        let mut claims_by_pool: BTreeMap<ResourcePoolId, Vec<&Claim>> = BTreeMap::new();
+        for claim in bundle.claims() {
+            claims_by_pool
+                .entry(claim.pool_id())
+                .or_default()
+                .push(claim);
+        }
+
+        let mut restored_timelines = BTreeMap::new();
         for (pool_id, claims) in claims_by_pool {
             let mut timeline = self
                 .slack_timelines
                 .get(&pool_id)
                 .ok_or(DomainError::ResourcePoolNotFound)?
                 .clone();
-
             for claim in claims {
-                let quantity = i128::from(claim.quantity());
-                let claim_delta = match adjustment {
-                    TimelineAdjustment::Consume => -quantity,
-                    TimelineAdjustment::Restore => quantity,
-                };
-
-                if adjustment == TimelineAdjustment::Consume {
-                    let available = timeline
-                        .minimum_slack(claim.interval())
-                        .map_err(|_| DomainError::IndexOverflow)?;
-                    if available < quantity {
-                        return Err(DomainError::CapacityExceeded);
-                    }
-                }
-
                 timeline
-                    .apply_delta(claim.interval(), claim_delta)
+                    .apply_delta(claim.interval(), i128::from(claim.quantity()))
                     .map_err(|_| DomainError::IndexOverflow)?;
             }
-
-            adjusted_timelines.insert(pool_id, timeline);
+            restored_timelines.insert(pool_id, timeline);
         }
 
-        Ok(adjusted_timelines)
-    }
-
-    /// Simulates candidate claims against a pool's derived slack index.
-    ///
-    /// The real timeline is left untouched. This test-only path is used to
-    /// compare the index with the authoritative reference calculation before
-    /// the index becomes part of admission control.
-    #[cfg(test)]
-    fn check_pool_availability_indexed(
-        &self,
-        pool_id: ResourcePoolId,
-        candidate_claims: &[&Claim],
-    ) -> Result<bool, DomainError> {
-        let mut simulated_timeline = self
-            .slack_timelines
-            .get(&pool_id)
-            .ok_or(DomainError::ResourcePoolNotFound)?
-            .clone();
-
-        for candidate_claim in candidate_claims {
-            let quantity = i128::from(candidate_claim.quantity());
-            let minimum_slack = simulated_timeline
-                .minimum_slack(candidate_claim.interval())
-                .map_err(|_| DomainError::IndexOverflow)?;
-
-            if minimum_slack < quantity {
-                return Ok(false);
-            }
-
-            simulated_timeline
-                .apply_delta(candidate_claim.interval(), -quantity)
-                .map_err(|_| DomainError::IndexOverflow)?;
-        }
-
-        Ok(true)
+        Ok(restored_timelines)
     }
 }
 
@@ -554,7 +679,7 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CapacitySegment, Interval};
+    use crate::domain::CapacitySegment;
 
     const NOW: Timestamp = 0;
     const EXPIRES_AT: Timestamp = 1_000;
@@ -590,6 +715,43 @@ mod tests {
         (engine, pool_id)
     }
 
+    fn variable_capacity_curve() -> CapacityCurve {
+        CapacityCurve::from_sorted(vec![
+            CapacitySegment::new(
+                Interval::new(0, 10).expect("the first interval should be valid"),
+                10,
+            ),
+            CapacitySegment::new(
+                Interval::new(10, 20).expect("the second interval should be valid"),
+                5,
+            ),
+        ])
+        .expect("the variable capacity curve should be valid")
+    }
+
+    fn create_pool_with_capacity_curve(
+        engine: &mut Engine,
+        capacity_curve: CapacityCurve,
+    ) -> ResourcePoolId {
+        let pool_id = ResourcePoolId::generate();
+        engine
+            .create_resource_pool_at(
+                pool_id,
+                "Variable pool".into(),
+                "units".into(),
+                capacity_curve,
+                NOW,
+            )
+            .expect("the resource pool should be created");
+        pool_id
+    }
+
+    fn engine_with_capacity_curve(capacity_curve: CapacityCurve) -> (Engine, ResourcePoolId) {
+        let mut engine = Engine::with_clock(FixedClock(NOW));
+        let pool_id = create_pool_with_capacity_curve(&mut engine, capacity_curve);
+        (engine, pool_id)
+    }
+
     fn claim(
         pool_id: ResourcePoolId,
         start: Timestamp,
@@ -611,9 +773,13 @@ mod tests {
         sequence: u64,
     ) -> PromiseId {
         let bundle = bundle(vec![claim]);
-        let adjusted_timelines = engine
-            .adjusted_timelines(&bundle, TimelineAdjustment::Consume)
-            .expect("the held promise should fit");
+        let adjusted_timelines = match engine
+            .evaluate_bundle_admission(&bundle)
+            .expect("the held promise should be evaluated")
+        {
+            BundleAdmission::Available(timelines) => timelines,
+            BundleAdmission::Unavailable(_) => panic!("the held promise should fit"),
+        };
         let promise = Promise::new(bundle, expires_at, NOW, SequenceNumber::new(sequence))
             .expect("the promise should be valid");
         let promise_id = promise.id();
@@ -625,6 +791,20 @@ mod tests {
 
     fn add_held_promise(engine: &mut Engine, claim: Claim, sequence: u64) -> PromiseId {
         add_held_promise_at(engine, claim, EXPIRES_AT, sequence)
+    }
+
+    fn indexed_availability(engine: &Engine, bundle: &Bundle) -> Result<bool, DomainError> {
+        match engine.evaluate_bundle_admission(bundle)? {
+            BundleAdmission::Available(_) => Ok(true),
+            BundleAdmission::Unavailable(_) => Ok(false),
+        }
+    }
+
+    fn held_promise_id(outcome: HoldOutcome) -> PromiseId {
+        match outcome {
+            HoldOutcome::Held(promise_id) => promise_id,
+            HoldOutcome::Unavailable { .. } => panic!("the bundle should be held"),
+        }
     }
 
     #[test]
@@ -654,6 +834,64 @@ mod tests {
             .slack_timeline(created_id)
             .expect("the resource pool should have a slack timeline");
         assert_eq!(timeline.slack_at(NOW), Ok(10));
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn hold_accepts_a_claim_within_a_higher_capacity_segment() {
+        let (mut engine, pool_id) = engine_with_capacity_curve(variable_capacity_curve());
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 7)]);
+
+        engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("the higher-capacity segment should admit the claim");
+
+        assert_eq!(
+            engine
+                .slack_timeline(pool_id)
+                .expect("the timeline should exist")
+                .slack_at(5),
+            Ok(3)
+        );
+    }
+
+    #[test]
+    fn hold_rejects_a_claim_within_a_lower_capacity_segment() {
+        let (mut engine, pool_id) = engine_with_capacity_curve(variable_capacity_curve());
+        let candidate = bundle(vec![claim(pool_id, 10, 20, 7)]);
+
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("unavailability should be a normal outcome");
+        let HoldOutcome::Unavailable { conflicts } = outcome else {
+            panic!("the lower-capacity segment should reject the claim");
+        };
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(10, 20).unwrap()
+        );
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn hold_rejects_a_claim_crossing_into_a_lower_capacity_segment() {
+        let (mut engine, pool_id) = engine_with_capacity_curve(variable_capacity_curve());
+        let candidate = bundle(vec![claim(pool_id, 5, 15, 7)]);
+
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("unavailability should be a normal outcome");
+        let HoldOutcome::Unavailable { conflicts } = outcome else {
+            panic!("crossing into lower capacity should reject the claim");
+        };
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(10, 15).unwrap()
+        );
         assert_eq!(engine.sequence().get(), 1);
     }
 
@@ -1077,19 +1315,36 @@ mod tests {
     fn availability_fails_when_the_pool_does_not_exist() {
         let engine = Engine::new();
         let candidate = bundle(vec![claim(ResourcePoolId::generate(), 0, 10, 1)]);
+        let reference_result = engine.check_availability(&candidate);
+        let indexed_result = indexed_availability(&engine, &candidate);
 
-        assert_eq!(
-            engine.check_availability(&candidate),
-            Err(DomainError::ResourcePoolNotFound)
-        );
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Err(DomainError::ResourcePoolNotFound));
+    }
+
+    #[test]
+    fn hold_rejects_a_missing_pool_without_mutating_the_engine() {
+        let mut engine = Engine::with_clock(FixedClock(NOW));
+        let missing_pool_id = ResourcePoolId::generate();
+        let candidate = bundle(vec![claim(missing_pool_id, 0, 10, 1)]);
+
+        let result = engine.hold_at(candidate, EXPIRES_AT, NOW);
+
+        assert_eq!(result, Err(DomainError::ResourcePoolNotFound));
+        assert!(engine.promises.is_empty());
+        assert!(engine.slack_timelines.is_empty());
+        assert_eq!(engine.sequence().get(), 0);
     }
 
     #[test]
     fn an_unreserved_pool_has_its_full_capacity_available() {
         let (engine, pool_id) = engine_with_pool(10);
         let candidate = bundle(vec![claim(pool_id, 0, 10, 10)]);
+        let reference_result = engine.check_availability(&candidate);
+        let indexed_result = indexed_availability(&engine, &candidate);
 
-        assert_eq!(engine.check_availability(&candidate), Ok(true));
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(true));
     }
 
     #[test]
@@ -1113,29 +1368,247 @@ mod tests {
     }
 
     #[test]
+    fn pool_admission_reports_combined_candidate_demand() {
+        let (engine, pool_id) = engine_with_pool(6);
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 4), claim(pool_id, 5, 15, 3)]);
+        let candidate_claims: Vec<&Claim> = candidate.claims().iter().collect();
+
+        let admission = engine
+            .evaluate_pool_admission(pool_id, &candidate_claims)
+            .expect("the pool should be evaluated");
+        let PoolAdmission::Unavailable(conflicts) = admission else {
+            panic!("the overlapping demand should be unavailable");
+        };
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(5, 10).unwrap()
+        );
+        assert_eq!(conflicts[0].required_quantity(), 7);
+        assert_eq!(conflicts[0].available_quantity(), 6);
+        assert_eq!(conflicts[0].deficit_quantity(), 1);
+    }
+
+    #[test]
+    fn pool_admission_reports_overlapping_active_promises() {
+        let (mut engine, pool_id) = engine_with_pool(6);
+        let active_promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 4), 1);
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 3)]);
+        let candidate_claims: Vec<&Claim> = candidate.claims().iter().collect();
+
+        let admission = engine
+            .evaluate_pool_admission(pool_id, &candidate_claims)
+            .expect("the pool should be evaluated");
+        let PoolAdmission::Unavailable(conflicts) = admission else {
+            panic!("the active promise should block the candidate");
+        };
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].conflicting_promise_ids(), &[active_promise_id]);
+    }
+
+    #[test]
+    fn available_pool_admission_returns_an_adjusted_copy() {
+        let (engine, pool_id) = engine_with_pool(6);
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 3), claim(pool_id, 5, 15, 3)]);
+        let candidate_claims: Vec<&Claim> = candidate.claims().iter().collect();
+
+        let admission = engine
+            .evaluate_pool_admission(pool_id, &candidate_claims)
+            .expect("the pool should be evaluated");
+        let PoolAdmission::Available(adjusted_timeline) = admission else {
+            panic!("the exact-fit demand should be available");
+        };
+
+        assert_eq!(adjusted_timeline.slack_at(2), Ok(3));
+        assert_eq!(adjusted_timeline.slack_at(7), Ok(0));
+        assert_eq!(adjusted_timeline.slack_at(12), Ok(3));
+        assert_eq!(
+            engine
+                .slack_timeline(pool_id)
+                .expect("the original timeline should exist")
+                .slack_at(7),
+            Ok(6)
+        );
+    }
+
+    #[test]
+    fn reference_and_indexed_availability_agree_with_active_usage() {
+        let capacity_curve = constant_capacity_curve(10);
+        let (mut engine, pool_id) = engine_with_capacity_curve(capacity_curve);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 4), 2);
+        let fitting_candidate = bundle(vec![claim(pool_id, 0, 10, 6)]);
+        let reference_result = engine.check_availability(&fitting_candidate);
+        let indexed_result = indexed_availability(&engine, &fitting_candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(true));
+
+        let exceeding_candidate = bundle(vec![claim(pool_id, 0, 10, 7)]);
+        let reference_result = engine.check_availability(&exceeding_candidate);
+        let indexed_result = indexed_availability(&engine, &exceeding_candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(false));
+    }
+
+    #[test]
+    fn reference_and_indexed_availability_agree_across_multiple_pools() {
+        let (mut engine, first_pool_id) = engine_with_capacity_curve(constant_capacity_curve(10));
+        let second_pool_id =
+            create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(5));
+
+        let fitting_candidate = bundle(vec![
+            claim(first_pool_id, 0, 10, 10),
+            claim(second_pool_id, 0, 10, 5),
+        ]);
+        let reference_result = engine.check_availability(&fitting_candidate);
+        let indexed_result = indexed_availability(&engine, &fitting_candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(true));
+
+        let exceeding_candidate = bundle(vec![
+            claim(first_pool_id, 0, 10, 10),
+            claim(second_pool_id, 0, 10, 6),
+        ]);
+        let reference_result = engine.check_availability(&exceeding_candidate);
+        let indexed_result = indexed_availability(&engine, &exceeding_candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(false));
+    }
+
+    #[test]
+    fn reference_and_indexed_availability_agree_across_a_capacity_gap() {
+        let capacity_curve = CapacityCurve::from_sorted(vec![
+            CapacitySegment::new(
+                Interval::new(0, 5).expect("the first interval should be valid"),
+                10,
+            ),
+            CapacitySegment::new(
+                Interval::new(10, 15).expect("the second interval should be valid"),
+                10,
+            ),
+        ])
+        .expect("the gapped capacity curve should be valid");
+        let (engine, pool_id) = engine_with_capacity_curve(capacity_curve);
+        let candidate = bundle(vec![claim(pool_id, 0, 15, 1)]);
+
+        let reference_result = engine.check_availability(&candidate);
+        let indexed_result = indexed_availability(&engine, &candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(false));
+    }
+
+    #[test]
+    fn reference_and_indexed_availability_agree_for_overlapping_candidate_claims() {
+        let (engine, pool_id) = engine_with_pool(10);
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 6), claim(pool_id, 5, 15, 5)]);
+
+        let reference_result = engine.check_availability(&candidate);
+        let indexed_result = indexed_availability(&engine, &candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(false));
+    }
+
+    #[test]
+    fn reference_and_indexed_availability_agree_for_adjacent_candidate_claims() {
+        let (engine, pool_id) = engine_with_pool(10);
+        let candidate = bundle(vec![claim(pool_id, 0, 5, 10), claim(pool_id, 5, 10, 10)]);
+
+        let reference_result = engine.check_availability(&candidate);
+        let indexed_result = indexed_availability(&engine, &candidate);
+
+        assert_eq!(reference_result, indexed_result);
+        assert_eq!(reference_result, Ok(true));
+    }
+
+    #[test]
+    fn unavailable_hold_returns_all_pool_conflicts_in_time_order() {
+        let (mut engine, later_pool_id) = engine_with_capacity_curve(constant_capacity_curve(5));
+        let earlier_pool_id =
+            create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(5));
+        let candidate = bundle(vec![
+            claim(later_pool_id, 10, 20, 6),
+            claim(earlier_pool_id, 0, 10, 7),
+        ]);
+        let sequence_before = engine.sequence();
+
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("unavailability should be a normal outcome");
+        let HoldOutcome::Unavailable { conflicts } = outcome else {
+            panic!("both pools should be unavailable");
+        };
+
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].resource_pool_id(), earlier_pool_id);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(0, 10).unwrap()
+        );
+        assert_eq!(conflicts[1].resource_pool_id(), later_pool_id);
+        assert_eq!(
+            conflicts[1].blocking_interval(),
+            Interval::new(10, 20).unwrap()
+        );
+        assert!(engine.promises.is_empty());
+        assert_eq!(engine.sequence(), sequence_before);
+    }
+
+    #[test]
+    fn failed_multi_pool_adjustment_does_not_mutate_any_timeline() {
+        let (mut engine, first_pool_id) = engine_with_capacity_curve(constant_capacity_curve(10));
+        let second_pool_id =
+            create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(5));
+        let candidate = bundle(vec![
+            claim(first_pool_id, 0, 10, 3),
+            claim(second_pool_id, 0, 10, 6),
+        ]);
+        let first_timeline_before = engine
+            .slack_timeline(first_pool_id)
+            .expect("the first timeline should exist")
+            .clone();
+        let second_timeline_before = engine
+            .slack_timeline(second_pool_id)
+            .expect("the second timeline should exist")
+            .clone();
+        let sequence_before = engine.sequence();
+
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("unavailability should be a normal outcome");
+
+        assert!(matches!(outcome, HoldOutcome::Unavailable { .. }));
+        assert_eq!(
+            engine.slack_timeline(first_pool_id),
+            Some(&first_timeline_before)
+        );
+        assert_eq!(
+            engine.slack_timeline(second_pool_id),
+            Some(&second_timeline_before)
+        );
+        assert_eq!(engine.sequence(), sequence_before);
+    }
+
+    #[test]
     fn overlapping_candidate_claims_are_checked_together() {
         let (engine, pool_id) = engine_with_pool(10);
         let candidate = bundle(vec![claim(pool_id, 0, 10, 6), claim(pool_id, 0, 10, 6)]);
-        let candidate_claims: Vec<&Claim> = candidate.claims().iter().collect();
 
         assert_eq!(engine.check_availability(&candidate), Ok(false));
-        assert_eq!(
-            engine.check_pool_availability_indexed(pool_id, &candidate_claims),
-            Ok(false)
-        );
     }
 
     #[test]
     fn consecutive_candidate_claims_are_not_added_together() {
         let (engine, pool_id) = engine_with_pool(10);
         let candidate = bundle(vec![claim(pool_id, 0, 5, 10), claim(pool_id, 5, 10, 10)]);
-        let candidate_claims: Vec<&Claim> = candidate.claims().iter().collect();
 
         assert_eq!(engine.check_availability(&candidate), Ok(true));
-        assert_eq!(
-            engine.check_pool_availability_indexed(pool_id, &candidate_claims),
-            Ok(true)
-        );
     }
 
     #[test]
@@ -1180,9 +1653,11 @@ mod tests {
         let expired_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 10), 100, 1);
         let candidate = bundle(vec![claim(pool_id, 0, 10, 10)]);
 
-        let new_id = engine
-            .hold_at(candidate, 200, 100)
-            .expect("the expired hold should release capacity");
+        let new_id = held_promise_id(
+            engine
+                .hold_at(candidate, 200, 100)
+                .expect("the expired hold should release capacity"),
+        );
 
         assert_eq!(
             engine

@@ -36,6 +36,21 @@ A claim consumes a positive quantity from one resource pool during one interval.
 
 Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together.
 
+## Hold admission
+
+An attempted hold has two normal outcomes:
+
+```text
+Held(promise_id)
+Unavailable { conflicts }
+```
+
+Insufficient capacity is not an engine error. An unavailable outcome contains every normalized blocking interval across all referenced pools. Conflicts contain the pool, interval, combined candidate demand, available slack, missing quantity, and IDs of overlapping active promises.
+
+Conflicts are ordered canonically by interval start, resource pool ID, and interval end. Adjacent conflicts within one pool are merged only when their quantities and conflicting promise IDs are identical. Capacity gaps are reported as zero availability.
+
+Unavailable holds do not create a promise, modify a timeline, or consume a sequence for the requested hold. Expirations processed before admission remain committed.
+
 ## Promise lifecycle
 
 ```text

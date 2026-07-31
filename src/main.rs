@@ -2,7 +2,7 @@ use promisedb::clock::{Clock, SystemClock};
 use promisedb::domain::{
     Bundle, CapacityCurve, CapacitySegment, Claim, DomainError, Interval, PromiseId, Timestamp,
 };
-use promisedb::engine::Engine;
+use promisedb::engine::{Engine, HoldOutcome};
 use std::error::Error;
 use std::io;
 
@@ -56,7 +56,13 @@ fn main() -> Result<(), Box<dyn Error>> {
     let claim = Claim::new(pool_id, interval, 1)?;
     let bundle = Bundle::new(vec![claim])?;
 
-    let promise_id = engine.hold(bundle, hold_deadline)?;
+    let promise_id = match engine.hold(bundle, hold_deadline)? {
+        HoldOutcome::Held(promise_id) => promise_id,
+        HoldOutcome::Unavailable { conflicts } => {
+            println!("hold unavailable: {conflicts:?}");
+            return Ok(());
+        }
+    };
     print_promise(&engine, promise_id, "hold")?;
 
     let held_version = engine
