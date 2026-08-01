@@ -17,7 +17,7 @@ pub use capacity_curve::{CapacityCurve, CapacitySegment};
 pub use claim::Claim;
 pub use error::DomainError;
 pub use interval::Interval;
-pub use promise::{Promise, PromiseId, PromiseState, SequenceNumber, Version};
+pub use promise::{Promise, PromiseId, PromiseState, ReplacementState, SequenceNumber, Version};
 pub use resource_pool::{ResourcePool, ResourcePoolId};
 /// An integer UTC timestamp.
 pub type Timestamp = i64;

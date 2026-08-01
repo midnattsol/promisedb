@@ -6,13 +6,13 @@
 
 mod availability;
 
-pub use availability::{AvailabilityConflict, HoldOutcome};
+pub use availability::{AvailabilityConflict, HoldOutcome, ReplaceOutcome};
 
 use crate::clock::{Clock, SystemClock};
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
-    ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
+    ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
@@ -356,6 +356,94 @@ impl Engine {
         self.release_at(promise_id, expected_version, now)
     }
 
+    /// Atomically replaces a live promise using an authoritative timestamp.
+    ///
+    /// Admission is evaluated against the final state: the old bundle is removed
+    /// on temporary timelines before the new bundle is applied. The original
+    /// promise and all authoritative timelines remain unchanged if admission fails.
+    /// Due expirations processed before replacement remain committed.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when expiration processing fails, the promise does not
+    /// exist, its version, state, or new deadline is invalid, or arithmetic
+    /// overflows. Insufficient capacity is returned as
+    /// [`ReplaceOutcome::Unavailable`].
+    pub(crate) fn replace_at(
+        &mut self,
+        promise_id: PromiseId,
+        expected_version: Version,
+        new_bundle: Bundle,
+        new_state: ReplacementState,
+        now: Timestamp,
+    ) -> Result<ReplaceOutcome, DomainError> {
+        self.process_expirations(now)?;
+
+        let mut replaced_promise = self
+            .promises
+            .get(&promise_id)
+            .ok_or(DomainError::PromiseNotFound)?
+            .clone();
+        if replaced_promise.state() == PromiseState::Expired {
+            return Err(DomainError::HoldExpired);
+        }
+
+        let old_bundle = replaced_promise.bundle().clone();
+        let next_sequence = self.next_sequence()?;
+        let new_version = replaced_promise.replace(
+            expected_version,
+            new_bundle.clone(),
+            new_state,
+            now,
+            next_sequence,
+        )?;
+        let mut final_timelines = self.restored_timelines(&old_bundle)?;
+
+        let adjusted_timelines =
+            match self.evaluate_bundle_with_overrides(&new_bundle, &final_timelines)? {
+                BundleAdmission::Available(timelines) => timelines,
+                BundleAdmission::Unavailable(mut conflicts) => {
+                    for conflict in &mut conflicts {
+                        conflict
+                            .conflicting_promise_ids
+                            .retain(|conflicting_id| *conflicting_id != promise_id);
+                    }
+                    return Ok(ReplaceOutcome::Unavailable { conflicts });
+                }
+            };
+        final_timelines.extend(adjusted_timelines);
+
+        self.promises.insert(promise_id, replaced_promise);
+        self.slack_timelines.extend(final_timelines);
+        self.sequence = next_sequence;
+
+        Ok(ReplaceOutcome::Replaced {
+            promise_id,
+            version: new_version,
+        })
+    }
+
+    /// Atomically replaces a live promise using one timestamp from the clock.
+    ///
+    /// The promise keeps its ID and creation sequence, receives the requested live
+    /// state and bundle, and advances by one local version on success.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock cannot provide a timestamp or replacement
+    /// validation fails. Insufficient capacity is a normal
+    /// [`ReplaceOutcome::Unavailable`] result.
+    pub fn replace(
+        &mut self,
+        promise_id: PromiseId,
+        expected_version: Version,
+        new_bundle: Bundle,
+        new_state: ReplacementState,
+    ) -> Result<ReplaceOutcome, DomainError> {
+        let now = self.clock.now()?;
+        self.replace_at(promise_id, expected_version, new_bundle, new_state, now)
+    }
+
     /// Checks an atomic bundle against committed usage in every referenced pool.
     ///
     /// Claims are grouped by pool so overlapping candidate claims are evaluated
@@ -484,10 +572,23 @@ impl Engine {
         pool_id: ResourcePoolId,
         candidate_claims: &[&Claim],
     ) -> Result<PoolAdmission, DomainError> {
-        let mut slack_timeline = self
+        let timeline = self
             .slack_timeline(pool_id)
-            .ok_or(DomainError::ResourcePoolNotFound)?
-            .clone();
+            .ok_or(DomainError::ResourcePoolNotFound)?;
+        self.evaluate_pool_on_timeline(pool_id, candidate_claims, timeline)
+    }
+
+    /// Evaluates one pool against a caller-provided base timeline.
+    ///
+    /// Replace uses this entry point after restoring the old bundle on temporary
+    /// timeline copies. The provided timeline is cloned and never mutated.
+    fn evaluate_pool_on_timeline(
+        &self,
+        pool_id: ResourcePoolId,
+        candidate_claims: &[&Claim],
+        base_timeline: &SlackTimeline,
+    ) -> Result<PoolAdmission, DomainError> {
+        let mut slack_timeline = base_timeline.clone();
         let mut demand_events: Vec<(Timestamp, i128)> = Vec::new();
 
         for claim in candidate_claims {
@@ -598,8 +699,20 @@ impl Engine {
         }
     }
 
-    /// Evaluates every pool in a bundle without mutating engine state.
+    /// Evaluates every pool in a bundle against current engine timelines.
     fn evaluate_bundle_admission(&self, bundle: &Bundle) -> Result<BundleAdmission, DomainError> {
+        self.evaluate_bundle_with_overrides(bundle, &BTreeMap::new())
+    }
+
+    /// Evaluates a bundle using temporary timelines when an override is present.
+    ///
+    /// Pools absent from `overrides` use the engine's current timeline.
+    /// Replace supplies restored old-bundle timelines through this map.
+    fn evaluate_bundle_with_overrides(
+        &self,
+        bundle: &Bundle,
+        overrides: &BTreeMap<ResourcePoolId, SlackTimeline>,
+    ) -> Result<BundleAdmission, DomainError> {
         let mut claims_by_pool: BTreeMap<ResourcePoolId, Vec<&Claim>> = BTreeMap::new();
         for claim in bundle.claims() {
             claims_by_pool
@@ -611,7 +724,12 @@ impl Engine {
         let mut adjusted_timelines = BTreeMap::new();
         let mut conflicts = Vec::new();
         for (pool_id, claims) in claims_by_pool {
-            match self.evaluate_pool_admission(pool_id, &claims)? {
+            let pool_admission = if let Some(timeline) = overrides.get(&pool_id) {
+                self.evaluate_pool_on_timeline(pool_id, &claims, timeline)?
+            } else {
+                self.evaluate_pool_admission(pool_id, &claims)?
+            };
+            match pool_admission {
                 PoolAdmission::Available(timeline) => {
                     adjusted_timelines.insert(pool_id, timeline);
                 }
@@ -1091,6 +1209,218 @@ mod tests {
     }
 
     #[test]
+    fn replacement_fits_only_after_removing_the_old_bundle() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        let original = engine
+            .promise(promise_id)
+            .expect("the promise should exist")
+            .clone();
+        let replacement = bundle(vec![claim(pool_id, 0, 10, 10)]);
+
+        let outcome = engine
+            .replace_at(
+                promise_id,
+                original.version(),
+                replacement.clone(),
+                ReplacementState::Committed,
+                NOW,
+            )
+            .expect("the final replacement state should fit");
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::Replaced {
+                promise_id,
+                version: original.version().next().unwrap(),
+            }
+        );
+        let replaced = engine
+            .promise(promise_id)
+            .expect("the replaced promise should exist");
+        assert_eq!(replaced.id(), original.id());
+        assert_eq!(replaced.created_sequence(), original.created_sequence());
+        assert_eq!(replaced.bundle(), &replacement);
+        assert_eq!(replaced.state(), PromiseState::Committed);
+        assert_eq!(replaced.version().get(), 2);
+        assert_eq!(replaced.updated_sequence(), engine.sequence());
+        assert_eq!(engine.sequence().get(), 2);
+        assert_eq!(
+            engine
+                .slack_timeline(pool_id)
+                .expect("the timeline should exist")
+                .slack_at(5),
+            Ok(0)
+        );
+    }
+
+    #[test]
+    fn unavailable_replacement_preserves_promise_timelines_and_sequence() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 20, 4), 1);
+        let original_promise = engine.promise(promise_id).unwrap().clone();
+        let original_timeline = engine.slack_timeline(pool_id).unwrap().clone();
+        let original_sequence = engine.sequence();
+        let replacement = bundle(vec![claim(pool_id, 0, 5, 11), claim(pool_id, 10, 15, 12)]);
+
+        let outcome = engine
+            .replace_at(
+                promise_id,
+                original_promise.version(),
+                replacement,
+                ReplacementState::Committed,
+                NOW,
+            )
+            .expect("unavailability should be a normal outcome");
+        let ReplaceOutcome::Unavailable { conflicts } = outcome else {
+            panic!("the replacement should be unavailable");
+        };
+
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(0, 5).unwrap()
+        );
+        assert_eq!(
+            conflicts[1].blocking_interval(),
+            Interval::new(10, 15).unwrap()
+        );
+        assert!(
+            conflicts
+                .iter()
+                .all(|conflict| !conflict.conflicting_promise_ids().contains(&promise_id))
+        );
+        assert_eq!(engine.promise(promise_id), Some(&original_promise));
+        assert_eq!(engine.slack_timeline(pool_id), Some(&original_timeline));
+        assert_eq!(engine.sequence(), original_sequence);
+    }
+
+    #[test]
+    fn replacement_moves_usage_between_resource_pools() {
+        let (mut engine, old_pool_id) = engine_with_pool(10);
+        let new_pool_id = create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(7));
+        let promise_id = add_held_promise(&mut engine, claim(old_pool_id, 0, 10, 6), 2);
+        let expected_version = engine.promise(promise_id).unwrap().version();
+
+        engine
+            .replace_at(
+                promise_id,
+                expected_version,
+                bundle(vec![claim(new_pool_id, 0, 10, 7)]),
+                ReplacementState::Committed,
+                NOW,
+            )
+            .expect("the cross-pool replacement should fit");
+
+        assert_eq!(
+            engine.slack_timeline(old_pool_id).unwrap().slack_at(5),
+            Ok(10)
+        );
+        assert_eq!(
+            engine.slack_timeline(new_pool_id).unwrap().slack_at(5),
+            Ok(0)
+        );
+        assert_eq!(engine.sequence().get(), 3);
+    }
+
+    #[test]
+    fn replacement_can_change_a_commitment_into_a_live_hold() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 4), 1);
+        let held_version = engine.promise(promise_id).unwrap().version();
+        let committed_version = engine
+            .commit_at(promise_id, held_version, NOW)
+            .expect("the promise should commit");
+
+        let outcome = engine
+            .replace_at(
+                promise_id,
+                committed_version,
+                bundle(vec![claim(pool_id, 10, 20, 5)]),
+                ReplacementState::Held { expires_at: 500 },
+                NOW,
+            )
+            .expect("the commitment should become a hold");
+
+        assert_eq!(
+            outcome,
+            ReplaceOutcome::Replaced {
+                promise_id,
+                version: committed_version.next().unwrap(),
+            }
+        );
+        assert_eq!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Held { expires_at: 500 }
+        );
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(10));
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(15), Ok(5));
+    }
+
+    #[test]
+    fn failed_replacement_validation_preserves_engine_state() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 4), 1);
+        let original_promise = engine.promise(promise_id).unwrap().clone();
+        let original_timeline = engine.slack_timeline(pool_id).unwrap().clone();
+        let wrong_version = original_promise.version().next().unwrap();
+
+        let result = engine.replace_at(
+            promise_id,
+            wrong_version,
+            bundle(vec![claim(pool_id, 10, 20, 4)]),
+            ReplacementState::Committed,
+            NOW,
+        );
+
+        assert_eq!(result, Err(DomainError::VersionConflict));
+        assert_eq!(engine.promise(promise_id), Some(&original_promise));
+        assert_eq!(engine.slack_timeline(pool_id), Some(&original_timeline));
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn replacement_processes_due_expiration_before_failing() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 10), 100, 1);
+        let expected_version = engine.promise(promise_id).unwrap().version();
+
+        let result = engine.replace_at(
+            promise_id,
+            expected_version,
+            bundle(vec![claim(pool_id, 10, 20, 10)]),
+            ReplacementState::Committed,
+            100,
+        );
+
+        assert_eq!(result, Err(DomainError::HoldExpired));
+        assert_eq!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Expired
+        );
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(10));
+        assert_eq!(engine.sequence().get(), 2);
+    }
+
+    #[test]
+    fn public_replace_uses_the_injected_clock_for_new_hold_deadlines() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        engine.clock = Box::new(FixedClock(100));
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 1), 1);
+        let expected_version = engine.promise(promise_id).unwrap().version();
+
+        let result = engine.replace(
+            promise_id,
+            expected_version,
+            bundle(vec![claim(pool_id, 0, 10, 1)]),
+            ReplacementState::Held { expires_at: 100 },
+        );
+
+        assert_eq!(result, Err(DomainError::InvalidExpiration));
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
     fn commit_at_the_deadline_expires_the_hold_and_returns_hold_expired() {
         let (mut engine, pool_id) = engine_with_pool(10);
         let promise_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 10), 100, 1);
@@ -1430,6 +1760,47 @@ mod tests {
                 .expect("the original timeline should exist")
                 .slack_at(7),
             Ok(6)
+        );
+    }
+
+    #[test]
+    fn timeline_overrides_allow_admission_after_restoring_old_usage() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let old_claim = claim(pool_id, 0, 10, 8);
+        add_held_promise(&mut engine, old_claim.clone(), 1);
+        let old_bundle = bundle(vec![old_claim]);
+        let new_bundle = bundle(vec![claim(pool_id, 0, 10, 10)]);
+
+        assert!(matches!(
+            engine
+                .evaluate_bundle_admission(&new_bundle)
+                .expect("the current state should be evaluated"),
+            BundleAdmission::Unavailable(_)
+        ));
+
+        let restored_timelines = engine
+            .restored_timelines(&old_bundle)
+            .expect("the old usage should be restorable");
+        let admission = engine
+            .evaluate_bundle_with_overrides(&new_bundle, &restored_timelines)
+            .expect("the replacement state should be evaluated");
+        let BundleAdmission::Available(adjusted_timelines) = admission else {
+            panic!("the replacement should fit after restoring old usage");
+        };
+
+        assert_eq!(
+            adjusted_timelines
+                .get(&pool_id)
+                .expect("the adjusted timeline should exist")
+                .slack_at(5),
+            Ok(0)
+        );
+        assert_eq!(
+            engine
+                .slack_timeline(pool_id)
+                .expect("the current timeline should remain unchanged")
+                .slack_at(5),
+            Ok(2)
         );
     }
 

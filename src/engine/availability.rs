@@ -1,6 +1,6 @@
 //! Structured outcomes produced by admission evaluation.
 
-use crate::domain::{Interval, PromiseId, Quantity, ResourcePoolId};
+use crate::domain::{Interval, PromiseId, Quantity, ResourcePoolId, Version};
 
 /// A time-bounded reason why a candidate bundle cannot be admitted.
 ///
@@ -59,6 +59,26 @@ pub enum HoldOutcome {
     /// The complete bundle was held atomically under the returned promise ID.
     Held(PromiseId),
     /// The bundle was not held because one or more intervals lack capacity.
+    Unavailable {
+        /// All normalized conflicts in deterministic order.
+        conflicts: Vec<AvailabilityConflict>,
+    },
+}
+
+/// The normal business outcome of an attempted atomic replacement.
+///
+/// Engine failures and invalid requests remain in the outer `Result`; insufficient
+/// capacity is represented by [`ReplaceOutcome::Unavailable`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReplaceOutcome {
+    /// The promise was replaced while preserving its identity.
+    Replaced {
+        /// The unchanged identity of the replaced promise.
+        promise_id: PromiseId,
+        /// The promise's new local version.
+        version: Version,
+    },
+    /// The original promise was preserved because the replacement lacks capacity.
     Unavailable {
         /// All normalized conflicts in deterministic order.
         conflicts: Vec<AvailabilityConflict>,

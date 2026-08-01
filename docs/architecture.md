@@ -44,9 +44,9 @@ The index uses chronologically ordered slack points grouped into bounded blocks.
 
 The engine creates a timeline with each resource pool and keeps it synchronized with promise transitions. A hold consumes slack, while release and expiration restore it. Commit does not adjust slack because both held and committed promises consume the same capacity.
 
-Timeline changes are first applied to copies of every affected pool's index. Every pool is evaluated so an unavailable hold can return all conflicts in canonical order. The engine publishes prepared copies only when the complete bundle succeeds, preventing partial index updates across pools.
+Timeline changes are first applied to copies of every affected pool's index. Every pool is evaluated so an unavailable operation can return all conflicts in canonical order. The engine publishes prepared copies only when the complete bundle succeeds, preventing partial index updates across pools.
 
-Hold admission uses `SlackTimeline` as its production hot path: preparing adjusted timeline copies both validates the complete bundle and computes the index state to publish. The slower calculation from capacity curves and active promises is compiled only for differential tests, where it remains a correctness oracle. Resource pools and promises remain authoritative and can reconstruct every timeline.
+Hold admission uses `SlackTimeline` as its production hot path: preparing adjusted timeline copies both validates the complete bundle and computes the index state to publish. Replace first restores the old bundle on temporary timeline copies, evaluates the new bundle against those overrides, and publishes only the resulting final timelines. Pools used only by the old bundle remain restored; shared and new pools receive the newly adjusted timelines. The slower calculation from capacity curves and active promises is compiled only for differential tests, where it remains a correctness oracle. Resource pools and promises remain authoritative and can reconstruct every timeline.
 
 ## Authoritative state
 

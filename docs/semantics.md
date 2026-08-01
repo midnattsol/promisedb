@@ -84,6 +84,20 @@ The engine also maintains one global monotonic `SequenceNumber`. Each successful
 
 Release transitions either a live hold or committed promise to `Released`. In the current-state model it removes the promise's claims from active usage. Historical facts will be preserved by durable events rather than by keeping released claims in the active usage index.
 
+## Replace
+
+Replace atomically changes the bundle and live state of a held or committed promise. The promise keeps its ID and `created_sequence`; its local version increments and `updated_sequence` advances.
+
+Admission is evaluated against the final usage:
+
+```text
+final usage = current usage - old bundle + new bundle
+```
+
+The old bundle is never released as an observable intermediate state. A replacement can therefore fit when the new bundle needs capacity currently held by the same promise. The target may be `Held { expires_at }` or `Committed`; a new hold deadline must be strictly later than `now`.
+
+Insufficient capacity returns `ReplaceOutcome::Unavailable { conflicts }`. It does not change the promise, timelines, version, or requested replacement sequence. Due expirations processed before replacement remain committed. Engine or validation failures likewise publish no partial replacement.
+
 ## Determinism
 
 Domain transitions receive `now` explicitly. Public engine operations obtain it from an injected clock. Replay and future replication must reuse the timestamp selected for the original command.

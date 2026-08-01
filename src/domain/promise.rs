@@ -89,6 +89,21 @@ pub enum PromiseState {
     Expired,
 }
 
+/// A live state requested for an atomic promise replacement.
+///
+/// Terminal states are intentionally excluded: replace changes an active
+/// commitment rather than releasing or expiring it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplacementState {
+    /// Replace the promise with a temporary hold using a new deadline.
+    Held {
+        /// The first timestamp at which the replacement hold is expired.
+        expires_at: Timestamp,
+    },
+    /// Replace the promise with a confirmed commitment.
+    Committed,
+}
+
 /// An accepted atomic bundle with a versioned lifecycle.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Promise {
@@ -225,6 +240,57 @@ impl Promise {
         }
     }
 
+    /// Replaces the bundle and live state while preserving promise identity.
+    ///
+    /// A successful replacement increments the local version and updates the
+    /// transition sequence. The creation sequence and promise ID remain unchanged.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a stale version, a terminal or expired source promise,
+    /// an invalid replacement deadline, or version overflow.
+    pub(crate) fn replace(
+        &mut self,
+        expected_version: Version,
+        new_bundle: Bundle,
+        new_state: ReplacementState,
+        now: Timestamp,
+        sequence: SequenceNumber,
+    ) -> Result<Version, DomainError> {
+        if expected_version != self.version {
+            return Err(DomainError::VersionConflict);
+        }
+
+        match self.state {
+            PromiseState::Held { expires_at } if expires_at <= now => {
+                return Err(DomainError::HoldExpired);
+            }
+            PromiseState::Held { .. } | PromiseState::Committed => {}
+            PromiseState::Released | PromiseState::Expired => {
+                return Err(DomainError::InvalidPromiseState);
+            }
+        }
+
+        if let ReplacementState::Held { expires_at } = new_state
+            && expires_at <= now
+        {
+            return Err(DomainError::InvalidExpiration);
+        }
+
+        let next_version = self.version.next()?;
+        let next_state = match new_state {
+            ReplacementState::Held { expires_at } => PromiseState::Held { expires_at },
+            ReplacementState::Committed => PromiseState::Committed,
+        };
+
+        self.bundle = new_bundle;
+        self.state = next_state;
+        self.version = next_version;
+        self.updated_sequence = sequence;
+
+        Ok(next_version)
+    }
+
     /// Expires a hold whose deadline has been reached.
     ///
     /// Expiration is an internal transition and therefore does not require an
@@ -278,6 +344,13 @@ mod tests {
     fn held_promise() -> Promise {
         Promise::new(bundle(), EXPIRES_AT, NOW, CREATED_SEQUENCE)
             .expect("the promise should be valid")
+    }
+
+    fn replacement_bundle() -> Bundle {
+        let interval = Interval::new(2_000, 3_000).expect("the interval should be valid");
+        let claim =
+            Claim::new(ResourcePoolId::generate(), interval, 2).expect("the claim should be valid");
+        Bundle::new(vec![claim]).expect("the bundle should be valid")
     }
 
     #[test]
@@ -430,6 +503,149 @@ mod tests {
             }
         );
         assert_eq!(promise.version().get(), 1);
+    }
+
+    #[test]
+    fn replaces_a_hold_with_a_new_hold_and_preserves_identity() {
+        let mut promise = held_promise();
+        let original_id = promise.id();
+        let original_created_sequence = promise.created_sequence();
+        let replacement = replacement_bundle();
+
+        let version = promise
+            .replace(
+                Version(1),
+                replacement.clone(),
+                ReplacementState::Held { expires_at: 300 },
+                NOW,
+                UPDATED_SEQUENCE,
+            )
+            .expect("the live hold should be replaced");
+
+        assert_eq!(promise.id(), original_id);
+        assert_eq!(promise.created_sequence(), original_created_sequence);
+        assert_eq!(promise.updated_sequence(), UPDATED_SEQUENCE);
+        assert_eq!(promise.bundle(), &replacement);
+        assert_eq!(promise.state(), PromiseState::Held { expires_at: 300 });
+        assert_eq!(version, Version(2));
+        assert_eq!(promise.version(), version);
+    }
+
+    #[test]
+    fn replaces_a_hold_with_a_commitment() {
+        let mut promise = held_promise();
+
+        promise
+            .replace(
+                Version(1),
+                replacement_bundle(),
+                ReplacementState::Committed,
+                NOW,
+                UPDATED_SEQUENCE,
+            )
+            .expect("the live hold should be replaced");
+
+        assert_eq!(promise.state(), PromiseState::Committed);
+    }
+
+    #[test]
+    fn replaces_a_commitment_with_either_live_state() {
+        let mut committed = held_promise();
+        committed
+            .commit(Version(1), NOW, UPDATED_SEQUENCE)
+            .expect("the hold should commit");
+        let mut held = committed.clone();
+
+        committed
+            .replace(
+                Version(2),
+                replacement_bundle(),
+                ReplacementState::Committed,
+                NOW,
+                SequenceNumber(12),
+            )
+            .expect("the commitment should remain committed");
+        held.replace(
+            Version(2),
+            replacement_bundle(),
+            ReplacementState::Held { expires_at: 300 },
+            NOW,
+            SequenceNumber(12),
+        )
+        .expect("the commitment should become a hold");
+
+        assert_eq!(committed.state(), PromiseState::Committed);
+        assert_eq!(held.state(), PromiseState::Held { expires_at: 300 });
+    }
+
+    #[test]
+    fn failed_replacement_validation_preserves_the_promise() {
+        let original = held_promise();
+
+        for (version, state, now, expected_error) in [
+            (
+                Version(2),
+                ReplacementState::Committed,
+                NOW,
+                DomainError::VersionConflict,
+            ),
+            (
+                Version(1),
+                ReplacementState::Held { expires_at: NOW },
+                NOW,
+                DomainError::InvalidExpiration,
+            ),
+            (
+                Version(1),
+                ReplacementState::Committed,
+                EXPIRES_AT,
+                DomainError::HoldExpired,
+            ),
+        ] {
+            let mut promise = original.clone();
+            let result =
+                promise.replace(version, replacement_bundle(), state, now, UPDATED_SEQUENCE);
+            assert_eq!(result, Err(expected_error));
+            assert_eq!(promise, original);
+        }
+    }
+
+    #[test]
+    fn rejects_replacement_from_terminal_states() {
+        for state in [PromiseState::Released, PromiseState::Expired] {
+            let mut promise = held_promise();
+            promise.state = state;
+            let original = promise.clone();
+
+            let result = promise.replace(
+                Version(1),
+                replacement_bundle(),
+                ReplacementState::Committed,
+                NOW,
+                UPDATED_SEQUENCE,
+            );
+
+            assert_eq!(result, Err(DomainError::InvalidPromiseState));
+            assert_eq!(promise, original);
+        }
+    }
+
+    #[test]
+    fn version_overflow_does_not_partially_replace() {
+        let mut promise = held_promise();
+        promise.version = Version(u64::MAX);
+        let original = promise.clone();
+
+        let result = promise.replace(
+            Version(u64::MAX),
+            replacement_bundle(),
+            ReplacementState::Committed,
+            NOW,
+            UPDATED_SEQUENCE,
+        );
+
+        assert_eq!(result, Err(DomainError::VersionOverflow));
+        assert_eq!(promise, original);
     }
 
     #[test]
