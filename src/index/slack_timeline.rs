@@ -347,6 +347,12 @@ impl SlackBlock {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SlackBound {
+    Minimum,
+    Maximum,
+}
+
 /// A blocked, normalized slack index for one resource pool.
 ///
 /// A timeline is derived from the pool's capacity curve and the claims of held
@@ -507,7 +513,7 @@ impl SlackTimeline {
     ///
     /// Returns [`IndexError::SlackOverflow`] if a stored block is inconsistent.
     pub fn minimum_slack(&self, interval: Interval) -> Result<Slack, IndexError> {
-        self.extreme_slack(interval, true)
+        self.slack_bound(interval, SlackBound::Minimum)
     }
 
     /// Returns normalized intervals whose effective slack is negative.
@@ -596,11 +602,11 @@ impl SlackTimeline {
     }
 
     fn maximum_slack(&self, interval: Interval) -> Result<Slack, IndexError> {
-        self.extreme_slack(interval, false)
+        self.slack_bound(interval, SlackBound::Maximum)
     }
 
-    fn extreme_slack(&self, interval: Interval, minimum: bool) -> Result<Slack, IndexError> {
-        let mut extreme = self.slack_at(interval.start())?;
+    fn slack_bound(&self, interval: Interval, bound: SlackBound) -> Result<Slack, IndexError> {
+        let mut bound_slack = self.slack_at(interval.start())?;
 
         for block in &self.blocks {
             let first_timestamp = block.points[0].timestamp();
@@ -611,16 +617,14 @@ impl SlackTimeline {
             }
 
             if first_timestamp >= interval.start() && last_timestamp < interval.end() {
-                let block_extreme = if minimum {
-                    block.minimum_slack
-                } else {
-                    block.maximum_slack
+                let block_bound = match bound {
+                    SlackBound::Minimum => block.minimum_slack,
+                    SlackBound::Maximum => block.maximum_slack,
                 }
                 .ok_or(IndexError::InvalidPointRange)?;
-                extreme = if minimum {
-                    extreme.min(block_extreme)
-                } else {
-                    extreme.max(block_extreme)
+                bound_slack = match bound {
+                    SlackBound::Minimum => bound_slack.min(block_bound),
+                    SlackBound::Maximum => bound_slack.max(block_bound),
                 };
                 continue;
             }
@@ -633,15 +637,14 @@ impl SlackTimeline {
                     .slack()
                     .checked_add(block.slack_delta)
                     .ok_or(IndexError::SlackOverflow)?;
-                extreme = if minimum {
-                    extreme.min(slack)
-                } else {
-                    extreme.max(slack)
+                bound_slack = match bound {
+                    SlackBound::Minimum => bound_slack.min(slack),
+                    SlackBound::Maximum => bound_slack.max(slack),
                 };
             }
         }
 
-        Ok(extreme)
+        Ok(bound_slack)
     }
 
     fn ensure_boundary(&mut self, timestamp: Timestamp) -> Result<(), IndexError> {
