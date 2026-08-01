@@ -5,6 +5,8 @@
 //! engine owns global state and evaluates availability across active promises.
 
 pub mod clock;
+pub mod command;
 pub mod domain;
 pub mod engine;
+pub mod event;
 pub mod index;

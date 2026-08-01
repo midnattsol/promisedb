@@ -13,11 +13,13 @@ pub use capacity_revision::{
 };
 
 use crate::clock::{Clock, SystemClock};
+use crate::command::{Command, CommandResult};
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
     ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
+use crate::event::Event;
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
 
@@ -47,6 +49,7 @@ pub struct Engine {
     resource_pools: BTreeMap<ResourcePoolId, ResourcePool>,
     slack_timelines: BTreeMap<ResourcePoolId, SlackTimeline>,
     promises: BTreeMap<PromiseId, Promise>,
+    events: Vec<Event>,
     sequence: SequenceNumber,
 }
 
@@ -66,6 +69,7 @@ impl Engine {
             resource_pools: BTreeMap::new(),
             slack_timelines: BTreeMap::new(),
             promises: BTreeMap::new(),
+            events: Vec::new(),
             sequence: SequenceNumber::new(0),
         }
     }
@@ -90,6 +94,34 @@ impl Engine {
     /// Returns a promise by ID.
     pub fn promise(&self, id: PromiseId) -> Option<&Promise> {
         self.promises.get(&id)
+    }
+
+    /// Returns emitted events whose sequence is at least `from_sequence`.
+    ///
+    /// Events are returned in global sequence order. The current scaffold remains
+    /// empty until command variants define their stable event payloads.
+    pub fn watch_events(&self, from_sequence: SequenceNumber) -> &[Event] {
+        let first = self
+            .events
+            .partition_point(|event| event.sequence() < from_sequence);
+        &self.events[first..]
+    }
+
+    /// Applies one deterministic command at an authoritative timestamp.
+    ///
+    /// Command variants and dispatch arms are intentionally supplied by the next
+    /// design step. Keeping `now` outside [`Command`] prevents clients from choosing
+    /// state-machine time while allowing replay to reuse the original timestamp.
+    ///
+    /// # Errors
+    ///
+    /// Returns an operation-specific domain error after command variants are added.
+    pub fn apply(
+        &mut self,
+        command: Command,
+        _now: Timestamp,
+    ) -> Result<CommandResult, DomainError> {
+        match command {}
     }
 
     /// Calculates, but does not commit, the next global sequence.
