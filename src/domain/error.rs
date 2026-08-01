@@ -30,6 +30,8 @@ pub enum DomainError {
     CapacityExceeded,
     /// A strict capacity revision would make active usage exceed capacity.
     CapacityRevisionCreatesDeficit,
+    /// A promise already exists with the supplied identifier.
+    PromiseAlreadyExists,
     /// A referenced promise does not exist.
     PromiseNotFound,
     /// An operation is not allowed from the promise's current state.
@@ -67,6 +69,7 @@ impl Display for DomainError {
             Self::CapacityRevisionCreatesDeficit => {
                 "strict capacity revision would create a deficit"
             }
+            Self::PromiseAlreadyExists => "promise already exists with the same identifier",
             Self::PromiseNotFound => "promise does not exist",
             Self::InvalidPromiseState => "operation is not allowed from the current promise state",
             Self::VersionConflict => "expected promise version does not match the current version",

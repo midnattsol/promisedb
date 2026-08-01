@@ -68,7 +68,8 @@ impl SequenceNumber {
 pub struct PromiseId(Uuid);
 
 impl PromiseId {
-    fn generate() -> Self {
+    /// Generates an opaque identity for command preparation.
+    pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
 }
@@ -116,15 +117,13 @@ pub struct Promise {
 }
 
 impl Promise {
-    /// Creates a held promise at version one.
-    ///
-    /// `now` and `sequence` must come from the authoritative engine rather than
-    /// from an external client.
+    /// Creates a held promise using an identity prepared before state-machine entry.
     ///
     /// # Errors
     ///
     /// Returns [`DomainError::InvalidExpiration`] when `expires_at <= now`.
-    pub(crate) fn new(
+    pub(crate) fn with_id(
+        id: PromiseId,
         bundle: Bundle,
         expires_at: Timestamp,
         now: Timestamp,
@@ -135,7 +134,7 @@ impl Promise {
         }
 
         Ok(Self {
-            id: PromiseId::generate(),
+            id,
             state: PromiseState::Held { expires_at },
             bundle,
             version: Version::INITIAL,
@@ -342,8 +341,14 @@ mod tests {
     }
 
     fn held_promise() -> Promise {
-        Promise::new(bundle(), EXPIRES_AT, NOW, CREATED_SEQUENCE)
-            .expect("the promise should be valid")
+        Promise::with_id(
+            PromiseId::generate(),
+            bundle(),
+            EXPIRES_AT,
+            NOW,
+            CREATED_SEQUENCE,
+        )
+        .expect("the promise should be valid")
     }
 
     fn replacement_bundle() -> Bundle {
@@ -371,14 +376,20 @@ mod tests {
 
     #[test]
     fn rejects_a_deadline_equal_to_now() {
-        let result = Promise::new(bundle(), NOW, NOW, CREATED_SEQUENCE);
+        let result = Promise::with_id(PromiseId::generate(), bundle(), NOW, NOW, CREATED_SEQUENCE);
 
         assert_eq!(result, Err(DomainError::InvalidExpiration));
     }
 
     #[test]
     fn rejects_a_deadline_before_now() {
-        let result = Promise::new(bundle(), NOW - 1, NOW, CREATED_SEQUENCE);
+        let result = Promise::with_id(
+            PromiseId::generate(),
+            bundle(),
+            NOW - 1,
+            NOW,
+            CREATED_SEQUENCE,
+        );
 
         assert_eq!(result, Err(DomainError::InvalidExpiration));
     }

@@ -28,4 +28,5 @@ ADRs explain why a decision exists. Current behavior belongs in `docs/semantics.
 - [ADR-0003: Authoritative state and reconstructible indexes](0003-authoritative-and-derived-state.md)
 - [ADR-0004: Blocked slack timeline](0004-blocked-slack-timeline.md)
 - [ADR-0005: Opaque UUID identifiers](0005-opaque-uuid-identifiers.md)
-- [ADR-0006: GNU AGPL v3 licensing](0006-agpl-v3-license.md)
+- [ADR-0006: GNU AGPL v3 licensing](0000-agpl-v3-license.md)
+- [ADR-0007: Control-plane preparation and deterministic commands](0007-control-plane-command-boundary.md)

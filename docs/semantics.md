@@ -84,6 +84,16 @@ expires_at <= now
 
 Due expirations are processed before each mutating command. Commit at or after the deadline fails with `HoldExpired`; the expiration transition itself remains applied.
 
+## Commands, idempotency identity, and events
+
+Every internal mutation is represented by a `Command` containing a common `(ClientId, IdempotencyKey)` pair and one `CommandOperation`. The control API generates resource-pool and promise IDs before command application. `Engine::apply(command, now)` therefore uses neither randomness nor the system clock.
+
+The command model carries idempotency identity, but duplicate detection and response caching are implemented by the later idempotency milestone. Reusing a key is not yet prevented by this phase.
+
+A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
+
+Queries are pure and do not process hold deadlines. Callers requiring an up-to-date deadline boundary must apply `ProcessExpirations` or another mutating command first.
+
 ## Version and sequence
 
 Each promise has a local version beginning at one. Every successful promise transition increments it. Mutations receive an expected version and reject stale requests with `VersionConflict`.

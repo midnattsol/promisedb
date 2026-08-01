@@ -808,7 +808,7 @@ impl SlackTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Bundle, CapacitySegment, SequenceNumber};
+    use crate::domain::{Bundle, CapacitySegment, PromiseId, SequenceNumber};
 
     fn point(timestamp: Timestamp, slack: Slack) -> SlackPoint {
         SlackPoint::new(timestamp, slack)
@@ -1158,7 +1158,8 @@ mod tests {
         let other_pool_id = ResourcePoolId::generate();
         let curve = capacity_curve(&[(0, 30, 10)]);
         let make_promise = |claim: Claim| {
-            Promise::new(
+            Promise::with_id(
+                PromiseId::generate(),
                 Bundle::new(vec![claim]).expect("the bundle should be valid"),
                 100,
                 0,

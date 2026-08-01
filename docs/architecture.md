@@ -18,9 +18,17 @@ src/
 
 The domain owns structural invariants for intervals, claims, bundles, promises, resource pools, and capacity curves. Domain objects do not read clocks or global state.
 
+### Command boundary
+
+The control API generates entity IDs, resolves external names, and wraps every mutation with a `ClientId` and `IdempotencyKey`. It then submits a deterministic `CommandOperation` through `Engine::apply(command, now)`. The explicit timestamp is selected outside the state machine and reused during replay.
+
+Commands are intended to be the future WAL recovery input. Stable events are derived audit facts exposed by `watch_events(from_sequence)`. One requested command may first emit multiple expiration events; each successful state transition owns one sequence, while multiple audit events describing one capacity revision may share that transition sequence.
+
+Queries such as `explain_unavailable` and `list_at_risk` are pure current-state reads. Deadline processing occurs before mutating commands or through `ProcessExpirations`.
+
 ### Engine
 
-`Engine` owns resource pools, promises, the global sequence number, and one derived `SlackTimeline` per pool. Public operations read the injected clock once and delegate to deterministic `*_at` transitions.
+`Engine` owns resource pools, promises, ordered audit events, the global sequence number, and one derived `SlackTimeline` per pool. Convenience operations read the injected clock once and delegate to deterministic `*_at` transitions; the durable command boundary receives `now` explicitly.
 
 ```text
 public operation

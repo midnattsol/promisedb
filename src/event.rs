@@ -1,6 +1,8 @@
 //! Stable audit records emitted by successful state transitions.
 
-use crate::domain::{PromiseId, ResourcePoolId, SequenceNumber, Timestamp, Version};
+use crate::domain::{
+    Interval, PromiseId, Quantity, ResourcePoolId, SequenceNumber, Timestamp, Version,
+};
 
 /// The kind of durable state transition represented by an [`Event`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -27,30 +29,61 @@ pub enum EventKind {
     DeficitResolved,
 }
 
-/// An entity referenced by an event without relying on memory layout.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum EventEntity {
-    /// A resource pool involved in the transition.
-    ResourcePool(ResourcePoolId),
-    /// A promise involved in the transition.
-    Promise(PromiseId),
+/// Minimal stable data needed to audit an event.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum EventData {
+    /// A resource-pool transition.
+    ResourcePool {
+        /// Pool involved in the transition.
+        resource_pool_id: ResourcePoolId,
+    },
+    /// A promise transition and its resulting version.
+    Promise {
+        /// Promise involved in the transition.
+        promise_id: PromiseId,
+        /// Version after the transition.
+        version: Version,
+    },
+    /// A capacity deficit transition.
+    Deficit {
+        /// Pool containing the deficit.
+        resource_pool_id: ResourcePoolId,
+        /// Interval affected by the transition.
+        interval: Interval,
+        /// Positive deficit magnitude.
+        quantity: Quantity,
+        /// Active promises overlapping the interval.
+        affected_promise_ids: Vec<PromiseId>,
+    },
 }
 
 /// A stable, ordered audit record for one successful state transition.
 ///
-/// Event-specific audit payloads are intentionally deferred until the command
-/// language is designed. IDs are represented as values; events never store
-/// pointers or references into engine state.
+/// Commands, rather than events, are intended to be the future recovery input.
+/// Events therefore contain minimal audit data and no references into engine state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     sequence: SequenceNumber,
     timestamp: Timestamp,
     kind: EventKind,
-    entities: Vec<EventEntity>,
-    promise_version: Option<Version>,
+    data: EventData,
 }
 
 impl Event {
+    pub(crate) fn new(
+        sequence: SequenceNumber,
+        timestamp: Timestamp,
+        kind: EventKind,
+        data: EventData,
+    ) -> Self {
+        Self {
+            sequence,
+            timestamp,
+            kind,
+            data,
+        }
+    }
+
     /// Returns the global sequence assigned to this transition.
     pub fn sequence(&self) -> SequenceNumber {
         self.sequence
@@ -66,13 +99,8 @@ impl Event {
         self.kind
     }
 
-    /// Returns referenced entities in canonical order.
-    pub fn entities(&self) -> &[EventEntity] {
-        &self.entities
-    }
-
-    /// Returns the resulting promise version when the event concerns a promise.
-    pub fn promise_version(&self) -> Option<Version> {
-        self.promise_version
+    /// Returns the stable audit payload.
+    pub fn data(&self) -> &EventData {
+        &self.data
     }
 }

@@ -13,13 +13,13 @@ pub use capacity_revision::{
 };
 
 use crate::clock::{Clock, SystemClock};
-use crate::command::{Command, CommandResult};
+use crate::command::{Command, CommandOperation, CommandResult};
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
     ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
-use crate::event::Event;
+use crate::event::{Event, EventData, EventKind};
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
 
@@ -98,8 +98,8 @@ impl Engine {
 
     /// Returns emitted events whose sequence is at least `from_sequence`.
     ///
-    /// Events are returned in global sequence order. The current scaffold remains
-    /// empty until command variants define their stable event payloads.
+    /// Events are returned in global sequence order. Multiple audit events for one
+    /// transition may share its sequence and retain their emission order.
     pub fn watch_events(&self, from_sequence: SequenceNumber) -> &[Event] {
         let first = self
             .events
@@ -109,19 +109,81 @@ impl Engine {
 
     /// Applies one deterministic command at an authoritative timestamp.
     ///
-    /// Command variants and dispatch arms are intentionally supplied by the next
-    /// design step. Keeping `now` outside [`Command`] prevents clients from choosing
-    /// state-machine time while allowing replay to reuse the original timestamp.
+    /// Keeping `now` outside [`Command`] prevents clients from choosing state-machine
+    /// time while allowing replay to reuse the original authoritative timestamp.
     ///
     /// # Errors
     ///
-    /// Returns an operation-specific domain error after command variants are added.
+    /// Returns the same operation-specific domain errors as the delegated
+    /// deterministic transition.
     pub fn apply(
         &mut self,
         command: Command,
-        _now: Timestamp,
+        now: Timestamp,
     ) -> Result<CommandResult, DomainError> {
-        match command {}
+        match command.into_operation() {
+            CommandOperation::CreateResourcePool {
+                resource_pool_id,
+                display_name,
+                unit,
+                capacity_curve,
+            } => {
+                self.create_resource_pool_at(
+                    resource_pool_id,
+                    display_name,
+                    unit,
+                    capacity_curve,
+                    now,
+                )?;
+                Ok(CommandResult::ResourcePoolCreated { resource_pool_id })
+            }
+            CommandOperation::ReviseCapacity {
+                resource_pool_id,
+                capacity_curve,
+                mode,
+            } => self
+                .revise_capacity_at(resource_pool_id, capacity_curve, mode, now)
+                .map(CommandResult::CapacityRevised),
+            CommandOperation::Hold {
+                promise_id,
+                bundle,
+                expires_at,
+            } => self
+                .hold_with_id_at(promise_id, bundle, expires_at, now)
+                .map(CommandResult::HoldCompleted),
+            CommandOperation::Commit {
+                promise_id,
+                expected_version,
+            } => {
+                let version = self.commit_at(promise_id, expected_version, now)?;
+                Ok(CommandResult::PromiseCommitted {
+                    promise_id,
+                    version,
+                })
+            }
+            CommandOperation::Release {
+                promise_id,
+                expected_version,
+            } => {
+                let version = self.release_at(promise_id, expected_version, now)?;
+                Ok(CommandResult::PromiseReleased {
+                    promise_id,
+                    version,
+                })
+            }
+            CommandOperation::Replace {
+                promise_id,
+                expected_version,
+                new_bundle,
+                new_state,
+            } => self
+                .replace_at(promise_id, expected_version, new_bundle, new_state, now)
+                .map(CommandResult::PromiseReplaced),
+            CommandOperation::ProcessExpirations => {
+                let expired_count = self.process_expirations(now)?;
+                Ok(CommandResult::ExpirationsProcessed { expired_count })
+            }
+        }
     }
 
     /// Calculates, but does not commit, the next global sequence.
@@ -168,10 +230,20 @@ impl Engine {
 
             expired_promise.expire(now, next_sequence)?;
             let adjusted_timelines = self.restored_timelines(expired_promise.bundle())?;
+            let version = expired_promise.version();
 
             self.promises.insert(promise_id, expired_promise);
             self.slack_timelines.extend(adjusted_timelines);
             self.sequence = next_sequence;
+            self.events.push(Event::new(
+                next_sequence,
+                now,
+                EventKind::HoldExpired,
+                EventData::Promise {
+                    promise_id,
+                    version,
+                },
+            ));
             expired_count += 1;
         }
 
@@ -210,6 +282,14 @@ impl Engine {
         self.resource_pools.insert(pool_id, pool);
         self.slack_timelines.insert(pool_id, slack_timeline);
         self.sequence = next_sequence;
+        self.events.push(Event::new(
+            next_sequence,
+            now,
+            EventKind::ResourceCreated,
+            EventData::ResourcePool {
+                resource_pool_id: pool_id,
+            },
+        ));
 
         Ok(pool_id)
     }
@@ -251,10 +331,16 @@ impl Engine {
     ) -> Result<CapacityRevisionOutcome, DomainError> {
         self.process_expirations(now)?;
 
-        let current_pool = self
+        let mut revised_pool = self
             .resource_pools
             .get(&pool_id)
+            .ok_or(DomainError::ResourcePoolNotFound)?
+            .clone();
+        let current_timeline = self
+            .slack_timelines
+            .get(&pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?;
+        let previous_deficits = self.capacity_deficits(pool_id, current_timeline)?;
         let active_promises: Vec<&Promise> = self.promises.values().collect();
         let revised_timeline =
             SlackTimeline::from_capacity_and_promises(&capacity_curve, pool_id, &active_promises)
@@ -266,7 +352,6 @@ impl Engine {
         }
 
         let next_sequence = self.next_sequence()?;
-        let mut revised_pool = current_pool.clone();
         revised_pool.replace_capacity_curve(capacity_curve);
         let mut affected_promise_ids: Vec<PromiseId> = deficits
             .iter()
@@ -278,6 +363,49 @@ impl Engine {
         self.resource_pools.insert(pool_id, revised_pool);
         self.slack_timelines.insert(pool_id, revised_timeline);
         self.sequence = next_sequence;
+        self.events.push(Event::new(
+            next_sequence,
+            now,
+            EventKind::CapacityRevised,
+            EventData::ResourcePool {
+                resource_pool_id: pool_id,
+            },
+        ));
+        for previous in &previous_deficits {
+            if !deficits
+                .iter()
+                .any(|current| current.interval.overlaps(&previous.interval))
+            {
+                self.events.push(Event::new(
+                    next_sequence,
+                    now,
+                    EventKind::DeficitResolved,
+                    Self::deficit_event_data(previous),
+                ));
+            }
+        }
+        for current in &deficits {
+            let unchanged = previous_deficits.iter().any(|previous| {
+                previous.interval == current.interval && previous.quantity == current.quantity
+            });
+            if unchanged {
+                continue;
+            }
+            let kind = if previous_deficits
+                .iter()
+                .any(|previous| previous.interval.overlaps(&current.interval))
+            {
+                EventKind::DeficitChanged
+            } else {
+                EventKind::DeficitCreated
+            };
+            self.events.push(Event::new(
+                next_sequence,
+                now,
+                kind,
+                Self::deficit_event_data(current),
+            ));
+        }
 
         Ok(CapacityRevisionOutcome {
             sequence: next_sequence,
@@ -301,23 +429,20 @@ impl Engine {
         self.revise_capacity_at(pool_id, capacity_curve, mode, now)
     }
 
-    /// Lists active promises overlapping current deficit intervals at `now`.
+    /// Lists active promises overlapping current deficit intervals.
     ///
-    /// Optional pool and time filters restrict which deficits are considered. Due
-    /// expirations are processed before the derived result is calculated.
+    /// This is a pure current-state query. Callers that require deadline processing
+    /// must first apply [`CommandOperation::ProcessExpirations`]. Optional pool and
+    /// time filters restrict which deficits are considered.
     ///
     /// # Errors
     ///
-    /// Returns an error for a missing requested pool, expiration failure, or index
-    /// arithmetic overflow.
-    pub(crate) fn list_at_risk_at(
-        &mut self,
+    /// Returns an error for a missing requested pool or index arithmetic overflow.
+    pub fn list_at_risk(
+        &self,
         resource_pool_id: Option<ResourcePoolId>,
         time_range: Option<Interval>,
-        now: Timestamp,
     ) -> Result<Vec<AtRiskPromise>, DomainError> {
-        self.process_expirations(now)?;
-
         if resource_pool_id.is_some_and(|pool_id| !self.resource_pools.contains_key(&pool_id)) {
             return Err(DomainError::ResourcePoolNotFound);
         }
@@ -350,51 +475,22 @@ impl Engine {
             .collect())
     }
 
-    /// Lists active promises overlapping current deficit intervals.
+    /// Explains every interval that prevents a bundle from being admitted.
+    ///
+    /// This is a pure current-state query and never consumes candidate capacity or
+    /// processes deadlines.
     ///
     /// # Errors
     ///
-    /// Returns an error when the clock or deterministic query transition fails.
-    pub fn list_at_risk(
-        &mut self,
-        resource_pool_id: Option<ResourcePoolId>,
-        time_range: Option<Interval>,
-    ) -> Result<Vec<AtRiskPromise>, DomainError> {
-        let now = self.clock.now()?;
-        self.list_at_risk_at(resource_pool_id, time_range, now)
-    }
-
-    /// Explains every interval that prevents a bundle from being admitted at `now`.
-    ///
-    /// This query never consumes candidate capacity. Due expirations are processed
-    /// first so the explanation observes the same state as a subsequent command.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when expiration or admission evaluation fails.
-    pub(crate) fn explain_unavailable_at(
-        &mut self,
+    /// Returns an error when admission evaluation fails.
+    pub fn explain_unavailable(
+        &self,
         bundle: &Bundle,
-        now: Timestamp,
     ) -> Result<Vec<AvailabilityConflict>, DomainError> {
-        self.process_expirations(now)?;
         match self.evaluate_bundle_admission(bundle)? {
             BundleAdmission::Available(_) => Ok(Vec::new()),
             BundleAdmission::Unavailable(conflicts) => Ok(conflicts),
         }
-    }
-
-    /// Explains every interval that currently prevents a bundle from admission.
-    ///
-    /// # Errors
-    ///
-    /// Returns an error when the clock or deterministic query transition fails.
-    pub fn explain_unavailable(
-        &mut self,
-        bundle: &Bundle,
-    ) -> Result<Vec<AvailabilityConflict>, DomainError> {
-        let now = self.clock.now()?;
-        self.explain_unavailable_at(bundle, now)
     }
 
     /// Atomically holds a bundle using an authoritative timestamp.
@@ -414,8 +510,27 @@ impl Engine {
         expires_at: Timestamp,
         now: Timestamp,
     ) -> Result<HoldOutcome, DomainError> {
+        self.hold_with_id_at(PromiseId::generate(), bundle, expires_at, now)
+    }
+
+    /// Atomically holds a bundle under an identity prepared by the control API.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a duplicate promise ID, invalid deadline, missing pool,
+    /// arithmetic overflow, or sequence exhaustion.
+    pub(crate) fn hold_with_id_at(
+        &mut self,
+        promise_id: PromiseId,
+        bundle: Bundle,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<HoldOutcome, DomainError> {
         self.process_expirations(now)?;
 
+        if self.promises.contains_key(&promise_id) {
+            return Err(DomainError::PromiseAlreadyExists);
+        }
         if expires_at <= now {
             return Err(DomainError::InvalidExpiration);
         }
@@ -427,12 +542,21 @@ impl Engine {
             }
         };
         let next_sequence = self.next_sequence()?;
-        let promise = Promise::new(bundle, expires_at, now, next_sequence)?;
-        let promise_id = promise.id();
+        let promise = Promise::with_id(promise_id, bundle, expires_at, now, next_sequence)?;
+        let version = promise.version();
 
         self.promises.insert(promise_id, promise);
         self.slack_timelines.extend(adjusted_timelines);
         self.sequence = next_sequence;
+        self.events.push(Event::new(
+            next_sequence,
+            now,
+            EventKind::HoldCreated,
+            EventData::Promise {
+                promise_id,
+                version,
+            },
+        ));
 
         Ok(HoldOutcome::Held(promise_id))
     }
@@ -486,6 +610,15 @@ impl Engine {
         let new_version = promise.commit(expected_version, now, new_sequence)?;
 
         self.sequence = new_sequence;
+        self.events.push(Event::new(
+            new_sequence,
+            now,
+            EventKind::HoldCommitted,
+            EventData::Promise {
+                promise_id,
+                version: new_version,
+            },
+        ));
 
         Ok(new_version)
     }
@@ -539,6 +672,15 @@ impl Engine {
         self.promises.insert(promise_id, released_promise);
         self.slack_timelines.extend(adjusted_timelines);
         self.sequence = new_sequence;
+        self.events.push(Event::new(
+            new_sequence,
+            now,
+            EventKind::PromiseReleased,
+            EventData::Promise {
+                promise_id,
+                version: new_version,
+            },
+        ));
 
         Ok(new_version)
     }
@@ -618,6 +760,15 @@ impl Engine {
         self.promises.insert(promise_id, replaced_promise);
         self.slack_timelines.extend(final_timelines);
         self.sequence = next_sequence;
+        self.events.push(Event::new(
+            next_sequence,
+            now,
+            EventKind::PromiseReplaced,
+            EventData::Promise {
+                promise_id,
+                version: new_version,
+            },
+        ));
 
         Ok(ReplaceOutcome::Replaced {
             promise_id,
@@ -969,6 +1120,15 @@ impl Engine {
         }
     }
 
+    fn deficit_event_data(deficit: &CapacityDeficit) -> EventData {
+        EventData::Deficit {
+            resource_pool_id: deficit.resource_pool_id,
+            interval: deficit.interval,
+            quantity: deficit.quantity,
+            affected_promise_ids: deficit.affected_promise_ids.clone(),
+        }
+    }
+
     /// Converts index-level negative slack into public capacity deficits.
     fn capacity_deficits(
         &self,
@@ -1139,6 +1299,14 @@ mod tests {
         Bundle::new(claims).expect("the bundle should be valid")
     }
 
+    fn command(operation: CommandOperation) -> Command {
+        Command::new(
+            crate::command::ClientId::new("test-client"),
+            crate::command::IdempotencyKey::new(format!("command-{operation:?}")),
+            operation,
+        )
+    }
+
     fn add_held_promise_at(
         engine: &mut Engine,
         claim: Claim,
@@ -1153,8 +1321,14 @@ mod tests {
             BundleAdmission::Available(timelines) => timelines,
             BundleAdmission::Unavailable(_) => panic!("the held promise should fit"),
         };
-        let promise = Promise::new(bundle, expires_at, NOW, SequenceNumber::new(sequence))
-            .expect("the promise should be valid");
+        let promise = Promise::with_id(
+            PromiseId::generate(),
+            bundle,
+            expires_at,
+            NOW,
+            SequenceNumber::new(sequence),
+        )
+        .expect("the promise should be valid");
         let promise_id = promise.id();
         engine.promises.insert(promise_id, promise);
         engine.slack_timelines.extend(adjusted_timelines);
@@ -1178,6 +1352,256 @@ mod tests {
             HoldOutcome::Held(promise_id) => promise_id,
             HoldOutcome::Unavailable { .. } => panic!("the bundle should be held"),
         }
+    }
+
+    #[test]
+    fn apply_dispatches_mutations_with_control_plane_ids() {
+        let mut engine = Engine::with_clock(FixedClock(NOW));
+        let pool_id = ResourcePoolId::generate();
+        let promise_id = PromiseId::generate();
+
+        let created = engine
+            .apply(
+                command(CommandOperation::CreateResourcePool {
+                    resource_pool_id: pool_id,
+                    display_name: "Command pool".into(),
+                    unit: "units".into(),
+                    capacity_curve: constant_capacity_curve(10),
+                }),
+                NOW,
+            )
+            .expect("the pool should be created");
+        assert_eq!(
+            created,
+            CommandResult::ResourcePoolCreated {
+                resource_pool_id: pool_id
+            }
+        );
+
+        let held = engine
+            .apply(
+                command(CommandOperation::Hold {
+                    promise_id,
+                    bundle: bundle(vec![claim(pool_id, 0, 10, 4)]),
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .expect("the bundle should be held");
+        assert_eq!(
+            held,
+            CommandResult::HoldCompleted(HoldOutcome::Held(promise_id))
+        );
+
+        let held_version = engine.promise(promise_id).unwrap().version();
+        let committed = engine
+            .apply(
+                command(CommandOperation::Commit {
+                    promise_id,
+                    expected_version: held_version,
+                }),
+                NOW,
+            )
+            .expect("the hold should commit");
+        let CommandResult::PromiseCommitted {
+            version: committed_version,
+            ..
+        } = committed
+        else {
+            panic!("the result should report a commit");
+        };
+
+        let replaced = engine
+            .apply(
+                command(CommandOperation::Replace {
+                    promise_id,
+                    expected_version: committed_version,
+                    new_bundle: bundle(vec![claim(pool_id, 10, 20, 5)]),
+                    new_state: ReplacementState::Committed,
+                }),
+                NOW,
+            )
+            .expect("the promise should be replaced");
+        let CommandResult::PromiseReplaced(ReplaceOutcome::Replaced {
+            version: replaced_version,
+            ..
+        }) = replaced
+        else {
+            panic!("the result should report a replacement");
+        };
+
+        let revised = engine
+            .apply(
+                command(CommandOperation::ReviseCapacity {
+                    resource_pool_id: pool_id,
+                    capacity_curve: constant_capacity_curve(12),
+                    mode: CapacityRevisionMode::Strict,
+                }),
+                NOW,
+            )
+            .expect("capacity should be revised");
+        assert!(matches!(revised, CommandResult::CapacityRevised(_)));
+
+        let released = engine
+            .apply(
+                command(CommandOperation::Release {
+                    promise_id,
+                    expected_version: replaced_version,
+                }),
+                NOW,
+            )
+            .expect("the promise should release");
+        assert!(matches!(released, CommandResult::PromiseReleased { .. }));
+
+        let kinds: Vec<EventKind> = engine
+            .watch_events(SequenceNumber::new(0))
+            .iter()
+            .map(Event::kind)
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::ResourceCreated,
+                EventKind::HoldCreated,
+                EventKind::HoldCommitted,
+                EventKind::PromiseReplaced,
+                EventKind::CapacityRevised,
+                EventKind::PromiseReleased,
+            ]
+        );
+        assert_eq!(engine.sequence().get(), 6);
+    }
+
+    #[test]
+    fn expiration_events_precede_the_requested_command_event() {
+        let mut engine = Engine::with_clock(FixedClock(NOW));
+        let first_pool_id = ResourcePoolId::generate();
+        engine
+            .apply(
+                command(CommandOperation::CreateResourcePool {
+                    resource_pool_id: first_pool_id,
+                    display_name: "First".into(),
+                    unit: "units".into(),
+                    capacity_curve: constant_capacity_curve(10),
+                }),
+                NOW,
+            )
+            .unwrap();
+        engine
+            .apply(
+                command(CommandOperation::Hold {
+                    promise_id: PromiseId::generate(),
+                    bundle: bundle(vec![claim(first_pool_id, 0, 10, 1)]),
+                    expires_at: 100,
+                }),
+                NOW,
+            )
+            .unwrap();
+
+        engine
+            .apply(
+                command(CommandOperation::CreateResourcePool {
+                    resource_pool_id: ResourcePoolId::generate(),
+                    display_name: "Second".into(),
+                    unit: "units".into(),
+                    capacity_curve: constant_capacity_curve(1),
+                }),
+                100,
+            )
+            .expect("expiration and creation should succeed");
+
+        let events = engine.watch_events(SequenceNumber::new(3));
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].kind(), EventKind::HoldExpired);
+        assert_eq!(events[0].sequence().get(), 3);
+        assert_eq!(events[1].kind(), EventKind::ResourceCreated);
+        assert_eq!(events[1].sequence().get(), 4);
+    }
+
+    #[test]
+    fn explicit_expiration_command_processes_deadlines() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 1), 100, 1);
+
+        let result = engine
+            .apply(command(CommandOperation::ProcessExpirations), 100)
+            .expect("due holds should expire");
+
+        assert_eq!(
+            result,
+            CommandResult::ExpirationsProcessed { expired_count: 1 }
+        );
+        assert_eq!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Expired
+        );
+        assert_eq!(
+            engine.watch_events(SequenceNumber::new(2))[0].kind(),
+            EventKind::HoldExpired
+        );
+    }
+
+    #[test]
+    fn capacity_revisions_emit_deficit_lifecycle_events() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .unwrap();
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(8),
+                CapacityRevisionMode::Strict,
+                NOW,
+            )
+            .unwrap();
+
+        let kinds: Vec<EventKind> = engine.events.iter().map(Event::kind).collect();
+        assert_eq!(
+            kinds,
+            vec![
+                EventKind::CapacityRevised,
+                EventKind::DeficitCreated,
+                EventKind::CapacityRevised,
+                EventKind::DeficitResolved,
+            ]
+        );
+        assert_eq!(engine.events[0].sequence(), engine.events[1].sequence());
+        assert_eq!(engine.events[2].sequence(), engine.events[3].sequence());
+    }
+
+    #[test]
+    fn duplicate_control_plane_promise_id_is_rejected_without_an_event() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        let first = command(CommandOperation::Hold {
+            promise_id,
+            bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+            expires_at: EXPIRES_AT,
+        });
+        engine.apply(first, NOW).unwrap();
+        let sequence = engine.sequence();
+        let event_count = engine.events.len();
+
+        let result = engine.apply(
+            command(CommandOperation::Hold {
+                promise_id,
+                bundle: bundle(vec![claim(pool_id, 10, 20, 1)]),
+                expires_at: EXPIRES_AT,
+            }),
+            NOW,
+        );
+
+        assert_eq!(result, Err(DomainError::PromiseAlreadyExists));
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.events.len(), event_count);
     }
 
     #[test]
@@ -1557,7 +1981,7 @@ mod tests {
         assert!(outcome.deficits().is_empty());
         assert!(
             engine
-                .list_at_risk_at(None, None, NOW)
+                .list_at_risk(None, None)
                 .expect("at-risk promises should be listed")
                 .is_empty()
         );
@@ -1601,10 +2025,10 @@ mod tests {
             .expect("the forced revision should be applied");
 
         let matching = engine
-            .list_at_risk_at(Some(pool_id), Some(Interval::new(5, 15).unwrap()), NOW)
+            .list_at_risk(Some(pool_id), Some(Interval::new(5, 15).unwrap()))
             .expect("the at-risk promises should be listed");
         let outside = engine
-            .list_at_risk_at(Some(pool_id), Some(Interval::new(10, 20).unwrap()), NOW)
+            .list_at_risk(Some(pool_id), Some(Interval::new(10, 20).unwrap()))
             .expect("the filtered result should be listed");
 
         assert_eq!(matching.len(), 1);
@@ -1628,7 +2052,7 @@ mod tests {
         let candidate = bundle(vec![claim(pool_id, 0, 10, 1)]);
 
         let conflicts = engine
-            .explain_unavailable_at(&candidate, NOW)
+            .explain_unavailable(&candidate)
             .expect("the unavailable bundle should be explained");
         let outcome = engine
             .hold_at(candidate, EXPIRES_AT, NOW)
@@ -2029,7 +2453,8 @@ mod tests {
     #[test]
     fn missing_promise_does_not_consume_a_commit_sequence() {
         let (mut engine, pool_id) = engine_with_pool(10);
-        let detached = Promise::new(
+        let detached = Promise::with_id(
+            PromiseId::generate(),
             bundle(vec![claim(pool_id, 0, 10, 1)]),
             EXPIRES_AT,
             NOW,
@@ -2046,7 +2471,8 @@ mod tests {
     #[test]
     fn missing_promise_does_not_consume_a_release_sequence() {
         let (mut engine, pool_id) = engine_with_pool(10);
-        let detached = Promise::new(
+        let detached = Promise::with_id(
+            PromiseId::generate(),
             bundle(vec![claim(pool_id, 0, 10, 1)]),
             EXPIRES_AT,
             NOW,
@@ -2114,7 +2540,8 @@ mod tests {
     fn expiration_sequence_remains_committed_when_the_command_fails() {
         let (mut engine, pool_id) = engine_with_pool(10);
         let expiring_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 1), 100, 1);
-        let detached = Promise::new(
+        let detached = Promise::with_id(
+            PromiseId::generate(),
             bundle(vec![claim(pool_id, 20, 30, 1)]),
             EXPIRES_AT,
             NOW,
