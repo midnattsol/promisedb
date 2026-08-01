@@ -11,3 +11,4 @@ pub mod engine;
 pub mod event;
 pub mod idempotency;
 pub mod index;
+pub mod storage;

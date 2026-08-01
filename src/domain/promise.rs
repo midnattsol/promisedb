@@ -14,6 +14,11 @@ pub struct Version(u64);
 impl Version {
     const INITIAL: Self = Self(1);
 
+    /// Creates a version from a non-zero numeric representation.
+    pub fn new(value: u64) -> Option<Self> {
+        (value != 0).then_some(Self(value))
+    }
+
     /// Returns the numeric representation of this version.
     pub fn get(self) -> u64 {
         self.0
@@ -71,6 +76,11 @@ impl PromiseId {
     /// Generates an opaque identity for command preparation.
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
+    }
+
+    /// Restores an opaque identity from its stable UUID bytes.
+    pub fn from_bytes(bytes: [u8; 16]) -> Self {
+        Self(Uuid::from_bytes(bytes))
     }
 
     /// Returns the stable 16-byte UUID representation.
