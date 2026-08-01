@@ -45,6 +45,14 @@ alternative 1: machine + operator in workshop B
 
 PromiseDB does not combine alternatives or reserve part of a rejected one. If no alternative fits, the outcome reports each alternative index with that bundle's complete availability conflicts.
 
+## Relative bundle and first-slot search
+
+A `RelativeClaim` describes a claim around a candidate anchor rather than at fixed timestamps. For a candidate start of `10:00`, offsets `-15 minutes` and `+45 minutes` materialize to `[09:45, 10:45)`. Negative offsets are allowed; the start offset must still be earlier than the end offset. A `RelativeBundle` groups one or more such claims.
+
+`find_first_slot` tries candidate anchors from an earliest bound through a latest bound at a positive fixed step and returns the first complete materialized bundle that fits. It is advisory: another mutation may consume that capacity afterward.
+
+`hold_first_slot` performs search and reservation as one serialized transition. There is no intermediate state where PromiseDB reports a slot and then races another hold for it. If no candidate fits, the outcome reports how many candidates were attempted rather than retaining potentially large conflict details for every window.
+
 ## Promise
 
 A `Promise` is created after a bundle is successfully held.
@@ -60,10 +68,11 @@ It records:
 The distinction is:
 
 ```text
-Claim    requirement for one pool
-Bundle   atomic collection of requirements
-Choice   ordered alternative bundles
-Promise  accepted bundle with identity and lifecycle
+Claim           requirement for one pool
+Bundle          atomic collection of requirements
+RelativeBundle  workflow positioned at candidate anchors
+Choice          ordered alternative bundles
+Promise         accepted bundle with identity and lifecycle
 ```
 
 The application decides how a business request becomes a bundle. PromiseDB decides whether that bundle can be accepted.

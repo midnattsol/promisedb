@@ -46,6 +46,8 @@ A new hold cannot consume capacity in an existing deficit. An atomic replacement
 
 A claim consumes a positive quantity from one resource pool during one interval. A bundle is a non-empty collection of claims accepted or rejected atomically. A `Choice` is a non-empty ordered collection of alternative bundles.
 
+A `RelativeClaim` contains a pool ID, half-open start and end offsets, and a positive quantity. Offsets may be negative, but the start offset must be less than the end offset. A `RelativeBundle` is non-empty. Materializing it at candidate start `s` translates each endpoint with checked `i64` addition, then constructs ordinary validated `Interval`, `Claim`, and `Bundle` values. Unrepresentable endpoints return `TimestampOverflow`.
+
 Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together. Choice order is significant: alternatives are evaluated from index zero and the first feasible bundle is selected.
 
 ## Hold admission
@@ -66,6 +68,16 @@ Unavailable holds do not create a promise, modify a timeline, or consume a seque
 `HoldOneOf` applies the same admission rules to an ordered `Choice`, using one control-plane `PromiseId` and one `expires_at`. It stops at the first feasible alternative and creates exactly one promise containing that complete bundle. Rejected alternatives publish no promise, timeline, sequence, or event changes; prepared timeline copies are discarded.
 
 `ChoiceOutcome::Held` identifies the promise and selected zero-based alternative index. If none fit, `Unavailable` returns one `ChoiceConflict` per alternative in choice order. Each entry contains its alternative index and that bundle's complete, canonically ordered `Vec<AvailabilityConflict>`. The requested operation then makes no state change.
+
+## First-slot search
+
+`find_first_slot` searches a `RelativeBundle` as a pure advisory query. `hold_first_slot` and durable `HoldFirstSlot` search and reserve within one serialized transition. Search bounds are candidate anchors, not materialized claim boundaries.
+
+The search requires `earliest_start <= latest_start` and `step > 0`. It evaluates `earliest_start`, then repeatedly advances by `step` using checked timestamp arithmetic while the next candidate is at or before `latest_start`. The latest bound is therefore included only when stepping lands on it. Search stops safely if another step is not representable.
+
+The first candidate whose complete materialized bundle passes ordinary indexed admission is returned as `Slot { start, bundle }`. Advisory search does not process expirations, consume capacity, emit events, or change sequence. It returns `None` when every candidate is unavailable.
+
+An authoritative slot hold processes due expirations once, then validates the prepared promise ID, deadline, and search. A feasible candidate is published through the same accepted-hold transition as an ordinary hold, with no observable search-then-hold gap. `SlotOutcome::Held { promise_id, start }` identifies the selected anchor. `SlotOutcome::Unavailable { attempts }` reports the number of candidates examined, saturated at `u64::MAX`, without retaining every candidate's conflicts. Unavailability makes no requested-operation state change; expirations processed first remain committed.
 
 ## Promise lifecycle
 
@@ -96,7 +108,7 @@ Every internal mutation is represented by a `Command` containing a common `(Clie
 
 The pair `(ClientId, IdempotencyKey)` identifies one command. PromiseDB hashes the normalized `CommandOperation` with BLAKE3 and caches its complete original response. An exact retry returns that response without processing expirations, consuming a sequence, emitting events, or inspecting current state. Reusing the pair with a different normalized operation returns `IdempotencyConflict`.
 
-Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing. Choice alternative order is significant and is preserved in the canonical representation, while each alternative bundle still uses canonical claim ordering.
+Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing. Relative-bundle claim order is likewise insignificant and is sorted by pool ID, start offset, end offset, and quantity. `HoldFirstSlot` identity includes its prepared promise ID, relative bundle, earliest and latest starts, step, and deadline. Choice alternative order is significant and is preserved in the canonical representation, while each alternative bundle still uses canonical claim ordering.
 
 A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
 

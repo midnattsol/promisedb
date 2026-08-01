@@ -2,8 +2,8 @@
 
 use crate::command::{CommandOperation, CommandResult};
 use crate::domain::{
-    Bundle, CapacityCurve, Choice, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId,
-    Unit, Version,
+    Bundle, CapacityCurve, Choice, Claim, Interval, PromiseId, RelativeBundle, RelativeClaim,
+    ReplacementState, ResourcePoolId, Unit, Version,
 };
 use crate::engine::CapacityRevisionMode;
 
@@ -28,6 +28,7 @@ enum OperationTag {
     Replace = 6,
     ProcessExpirations = 7,
     HoldOneOf = 8,
+    HoldFirstSlot = 9,
 }
 
 impl OperationTag {
@@ -37,6 +38,7 @@ impl OperationTag {
             CommandOperation::ReviseCapacity { .. } => Self::ReviseCapacity,
             CommandOperation::Hold { .. } => Self::Hold,
             CommandOperation::HoldOneOf { .. } => Self::HoldOneOf,
+            CommandOperation::HoldFirstSlot { .. } => Self::HoldFirstSlot,
             CommandOperation::Commit { .. } => Self::Commit,
             CommandOperation::Release { .. } => Self::Release,
             CommandOperation::Replace { .. } => Self::Replace,
@@ -174,6 +176,33 @@ impl CanonicalHash for Choice {
     }
 }
 
+impl CanonicalHash for RelativeClaim {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        self.pool_id().update_hash(hasher);
+        self.start_offset().update_hash(hasher);
+        self.end_offset().update_hash(hasher);
+        self.quantity().update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for RelativeBundle {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        let mut claims: Vec<&RelativeClaim> = self.claims().iter().collect();
+        claims.sort_unstable_by_key(|claim| {
+            (
+                claim.pool_id().as_bytes(),
+                claim.start_offset(),
+                claim.end_offset(),
+                claim.quantity(),
+            )
+        });
+        update_length(claims.len(), hasher);
+        for claim in claims {
+            claim.update_hash(hasher);
+        }
+    }
+}
+
 impl CanonicalHash for CapacityRevisionMode {
     fn update_hash(&self, hasher: &mut blake3::Hasher) {
         let tag = match self {
@@ -257,6 +286,7 @@ pub fn hash_operation(operation: &CommandOperation) -> CommandHash {
 /// - encode strings and collections with explicit lengths;
 /// - encode UUID-backed IDs as their 16 stable bytes;
 /// - sort bundle claims by pool ID, interval start, interval end, and quantity;
+/// - sort relative claims by pool ID, offsets, and quantity;
 /// - preserve the order of alternatives in a choice;
 /// - never depend on Rust memory layout or `Hash` implementations.
 fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::Hasher) {
@@ -301,6 +331,21 @@ fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::
             choice.update_hash(hasher);
             expires_at.update_hash(hasher);
         }
+        CommandOperation::HoldFirstSlot {
+            promise_id,
+            relative_bundle,
+            earliest_start,
+            latest_start,
+            step,
+            expires_at,
+        } => {
+            promise_id.update_hash(hasher);
+            relative_bundle.update_hash(hasher);
+            earliest_start.update_hash(hasher);
+            latest_start.update_hash(hasher);
+            step.update_hash(hasher);
+            expires_at.update_hash(hasher);
+        }
         CommandOperation::Commit {
             promise_id,
             expected_version,
@@ -331,7 +376,9 @@ fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::
 mod tests {
     use super::*;
     use crate::command::CommandOperation;
-    use crate::domain::{Bundle, Claim, Interval, ResourcePoolId, Unit};
+    use crate::domain::{
+        Bundle, Claim, Interval, RelativeBundle, RelativeClaim, ResourcePoolId, Unit,
+    };
 
     fn claim(pool_id: ResourcePoolId, start: i64, end: i64, quantity: u64) -> Claim {
         Claim::new(pool_id, Interval::new(start, end).unwrap(), quantity).unwrap()
@@ -356,6 +403,74 @@ mod tests {
         };
 
         assert_eq!(hash_operation(&first), hash_operation(&reordered));
+    }
+
+    #[test]
+    fn relative_claim_order_does_not_change_the_hash() {
+        let first_pool = ResourcePoolId::generate();
+        let second_pool = ResourcePoolId::generate();
+        let first_claim = RelativeClaim::new(first_pool, -5, 10, 2).unwrap();
+        let second_claim = RelativeClaim::new(second_pool, 0, 20, 1).unwrap();
+        let promise_id = PromiseId::generate();
+        let operation = |claims| CommandOperation::HoldFirstSlot {
+            promise_id,
+            relative_bundle: RelativeBundle::new(claims).unwrap(),
+            earliest_start: 10,
+            latest_start: 100,
+            step: 5,
+            expires_at: 200,
+        };
+
+        assert_eq!(
+            hash_operation(&operation(vec![first_claim.clone(), second_claim.clone()])),
+            hash_operation(&operation(vec![second_claim, first_claim]))
+        );
+    }
+
+    #[test]
+    fn relative_claim_fields_change_the_hash() {
+        let pool_id = ResourcePoolId::generate();
+        let promise_id = PromiseId::generate();
+        let operation = |start_offset, end_offset, quantity| CommandOperation::HoldFirstSlot {
+            promise_id,
+            relative_bundle: RelativeBundle::new(vec![
+                RelativeClaim::new(pool_id, start_offset, end_offset, quantity).unwrap(),
+            ])
+            .unwrap(),
+            earliest_start: 10,
+            latest_start: 100,
+            step: 5,
+            expires_at: 200,
+        };
+        let original = hash_operation(&operation(-5, 10, 2));
+
+        assert_ne!(original, hash_operation(&operation(-4, 10, 2)));
+        assert_ne!(original, hash_operation(&operation(-5, 11, 2)));
+        assert_ne!(original, hash_operation(&operation(-5, 10, 3)));
+    }
+
+    #[test]
+    fn slot_search_fields_change_the_hash() {
+        let pool_id = ResourcePoolId::generate();
+        let promise_id = PromiseId::generate();
+        let operation =
+            |earliest_start, latest_start, step, expires_at| CommandOperation::HoldFirstSlot {
+                promise_id,
+                relative_bundle: RelativeBundle::new(vec![
+                    RelativeClaim::new(pool_id, -5, 10, 2).unwrap(),
+                ])
+                .unwrap(),
+                earliest_start,
+                latest_start,
+                step,
+                expires_at,
+            };
+        let original = hash_operation(&operation(10, 100, 5, 200));
+
+        assert_ne!(original, hash_operation(&operation(11, 100, 5, 200)));
+        assert_ne!(original, hash_operation(&operation(10, 101, 5, 200)));
+        assert_ne!(original, hash_operation(&operation(10, 100, 6, 200)));
+        assert_ne!(original, hash_operation(&operation(10, 100, 5, 201)));
     }
 
     #[test]

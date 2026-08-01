@@ -1,6 +1,6 @@
 //! Structured outcomes produced by admission evaluation.
 
-use crate::domain::{Interval, PromiseId, Quantity, ResourcePoolId, Version};
+use crate::domain::{Bundle, Interval, PromiseId, Quantity, ResourcePoolId, Timestamp, Version};
 
 /// A time-bounded reason why a candidate bundle cannot be admitted.
 ///
@@ -48,6 +48,42 @@ impl AvailabilityConflict {
     pub fn conflicting_promise_ids(&self) -> &[PromiseId] {
         &self.conflicting_promise_ids
     }
+}
+
+/// The first feasible materialized bundle found in a candidate range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Slot {
+    pub(super) start: Timestamp,
+    pub(super) bundle: Bundle,
+}
+
+impl Slot {
+    /// Returns the candidate anchor selected by the search.
+    pub fn start(&self) -> Timestamp {
+        self.start
+    }
+
+    /// Returns the materialized bundle feasible at the selected anchor.
+    pub fn bundle(&self) -> &Bundle {
+        &self.bundle
+    }
+}
+
+/// The normal business outcome of searching for and holding a slot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotOutcome {
+    /// The first feasible slot was held atomically.
+    Held {
+        /// The predetermined identity of the created promise.
+        promise_id: PromiseId,
+        /// The selected candidate anchor.
+        start: Timestamp,
+    },
+    /// No candidate was feasible and no promise was created.
+    Unavailable {
+        /// Exact number of candidates evaluated.
+        attempts: u128,
+    },
 }
 
 /// The normal business outcome of an attempted hold.

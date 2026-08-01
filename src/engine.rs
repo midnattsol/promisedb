@@ -8,7 +8,8 @@ mod availability;
 mod capacity_revision;
 
 pub use availability::{
-    AvailabilityConflict, ChoiceConflict, ChoiceOutcome, HoldOutcome, ReplaceOutcome,
+    AvailabilityConflict, ChoiceConflict, ChoiceOutcome, HoldOutcome, ReplaceOutcome, Slot,
+    SlotOutcome,
 };
 pub use capacity_revision::{
     AtRiskPromise, CapacityDeficit, CapacityRevisionMode, CapacityRevisionOutcome,
@@ -19,7 +20,8 @@ use crate::command::{ClientId, Command, CommandOperation, CommandResult, Idempot
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Choice, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
-    ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Unit, Version,
+    RelativeBundle, ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp,
+    Unit, Version,
 };
 use crate::event::{Event, EventData, EventKind};
 use crate::idempotency::{IdempotencyRecord, hash_operation};
@@ -40,6 +42,22 @@ enum BundleAdmission {
     Available(BTreeMap<ResourcePoolId, SlackTimeline>),
     /// The bundle does not fit and no timeline may be published.
     Unavailable(Vec<AvailabilityConflict>),
+}
+
+/// Prepared result of searching a relative bundle over candidate starts.
+enum SlotSearch {
+    Found {
+        slot: Slot,
+        timelines: BTreeMap<ResourcePoolId, SlackTimeline>,
+    },
+    Unavailable(u128),
+}
+
+#[derive(Clone, Copy)]
+struct SlotRange {
+    earliest: Timestamp,
+    latest: Timestamp,
+    step: i64,
 }
 
 /// The single-node state machine for PromiseDB.
@@ -195,6 +213,26 @@ impl Engine {
             } => self
                 .hold_choice_at(promise_id, choice, expires_at, now)
                 .map(CommandResult::ChoiceCompleted),
+            CommandOperation::HoldFirstSlot {
+                promise_id,
+                relative_bundle,
+                earliest_start,
+                latest_start,
+                step,
+                expires_at,
+            } => self
+                .hold_slot_at(
+                    promise_id,
+                    relative_bundle,
+                    SlotRange {
+                        earliest: earliest_start,
+                        latest: latest_start,
+                        step,
+                    },
+                    expires_at,
+                    now,
+                )
+                .map(CommandResult::SlotCompleted),
             CommandOperation::Commit {
                 promise_id,
                 expected_version,
@@ -535,6 +573,144 @@ impl Engine {
             BundleAdmission::Available(_) => Ok(Vec::new()),
             BundleAdmission::Unavailable(conflicts) => Ok(conflicts),
         }
+    }
+
+    /// Finds the first feasible materialization in an inclusive candidate range.
+    ///
+    /// Candidates are evaluated deterministically from `earliest_start`, advancing
+    /// by `step` while the next start remains at or before `latest_start`. This is a
+    /// pure advisory query: it does not process expirations or mutate engine state.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DomainError::InvalidSearchRange`] for reversed bounds,
+    /// [`DomainError::InvalidStep`] for a non-positive step, or an error raised by
+    /// timestamp materialization or indexed admission.
+    pub fn find_first_slot(
+        &self,
+        relative_bundle: &RelativeBundle,
+        earliest_start: Timestamp,
+        latest_start: Timestamp,
+        step: i64,
+    ) -> Result<Option<Slot>, DomainError> {
+        let range = SlotRange {
+            earliest: earliest_start,
+            latest: latest_start,
+            step,
+        };
+        match self.search_slots(relative_bundle, range)? {
+            SlotSearch::Found { slot, .. } => Ok(Some(slot)),
+            SlotSearch::Unavailable(_) => Ok(None),
+        }
+    }
+
+    fn search_slots(
+        &self,
+        relative_bundle: &RelativeBundle,
+        range: SlotRange,
+    ) -> Result<SlotSearch, DomainError> {
+        if range.earliest > range.latest {
+            return Err(DomainError::InvalidSearchRange);
+        }
+        if range.step <= 0 {
+            return Err(DomainError::InvalidStep);
+        }
+
+        let mut start = range.earliest;
+        let mut attempts = 0_u128;
+        loop {
+            attempts += 1;
+            let bundle = relative_bundle.materialize(start)?;
+            if let BundleAdmission::Available(timelines) =
+                self.evaluate_bundle_admission(&bundle)?
+            {
+                return Ok(SlotSearch::Found {
+                    slot: Slot { start, bundle },
+                    timelines,
+                });
+            }
+
+            if start == range.latest {
+                break;
+            }
+            let Some(next) = start.checked_add(range.step) else {
+                break;
+            };
+            if next > range.latest {
+                break;
+            }
+            start = next;
+        }
+
+        Ok(SlotSearch::Unavailable(attempts))
+    }
+
+    /// Searches and holds the first feasible slot under a prepared promise ID.
+    ///
+    /// Due expirations are processed once before duplicate-ID, deadline, and search
+    /// validation. The selected materialized bundle and prepared timelines are
+    /// published together through the ordinary accepted-hold transition.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for expiration processing failure, a duplicate promise ID,
+    /// invalid deadline or search inputs, timestamp or admission arithmetic failure,
+    /// a missing pool, or sequence exhaustion.
+    fn hold_slot_at(
+        &mut self,
+        promise_id: PromiseId,
+        relative_bundle: RelativeBundle,
+        range: SlotRange,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<SlotOutcome, DomainError> {
+        self.process_expirations(now)?;
+
+        if self.promises.contains_key(&promise_id) {
+            return Err(DomainError::PromiseAlreadyExists);
+        }
+        if expires_at <= now {
+            return Err(DomainError::InvalidExpiration);
+        }
+
+        match self.search_slots(&relative_bundle, range)? {
+            SlotSearch::Found { slot, timelines } => {
+                let start = slot.start;
+                self.accept_hold(promise_id, slot.bundle, expires_at, now, timelines)?;
+                Ok(SlotOutcome::Held { promise_id, start })
+            }
+            SlotSearch::Unavailable(attempts) => Ok(SlotOutcome::Unavailable { attempts }),
+        }
+    }
+
+    /// Searches and holds the first feasible slot using one clock timestamp.
+    ///
+    /// The created promise receives an engine-generated ID. Durable callers should
+    /// submit [`CommandOperation::HoldFirstSlot`] with a control-plane ID instead.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock or deterministic slot transition fails.
+    pub fn hold_first_slot(
+        &mut self,
+        relative_bundle: RelativeBundle,
+        earliest_start: Timestamp,
+        latest_start: Timestamp,
+        step: i64,
+        expires_at: Timestamp,
+    ) -> Result<SlotOutcome, DomainError> {
+        let now = self.clock.now()?;
+        self.hold_slot_at(
+            PromiseId::generate(),
+            relative_bundle,
+            SlotRange {
+                earliest: earliest_start,
+                latest: latest_start,
+                step,
+            },
+            expires_at,
+            now,
+        )
     }
 
     /// Atomically holds a bundle using an authoritative timestamp.
@@ -1336,7 +1512,7 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::CapacitySegment;
+    use crate::domain::{CapacitySegment, RelativeClaim};
 
     const NOW: Timestamp = 0;
     const EXPIRES_AT: Timestamp = 1_000;
@@ -1427,6 +1603,20 @@ mod tests {
         Bundle::new(claims).expect("the bundle should be valid")
     }
 
+    fn relative_bundle(claims: Vec<RelativeClaim>) -> RelativeBundle {
+        RelativeBundle::new(claims).expect("the relative bundle should be valid")
+    }
+
+    fn relative_claim(
+        pool_id: ResourcePoolId,
+        start_offset: i64,
+        end_offset: i64,
+        quantity: Quantity,
+    ) -> RelativeClaim {
+        RelativeClaim::new(pool_id, start_offset, end_offset, quantity)
+            .expect("the relative claim should be valid")
+    }
+
     fn choice(alternatives: Vec<Bundle>) -> Choice {
         Choice::new(alternatives).expect("the choice should be valid")
     }
@@ -1488,6 +1678,317 @@ mod tests {
             HoldOutcome::Held(promise_id) => promise_id,
             HoldOutcome::Unavailable { .. } => panic!("the bundle should be held"),
         }
+    }
+
+    #[test]
+    fn finds_the_exact_earliest_slot() {
+        let (engine, pool_id) = engine_with_pool(1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]);
+
+        let slot = engine
+            .find_first_slot(&relative, 20, 40, 5)
+            .unwrap()
+            .expect("the earliest slot should fit");
+
+        assert_eq!(slot.start(), 20);
+        assert_eq!(
+            slot.bundle().claims()[0].interval(),
+            Interval::new(20, 30).unwrap()
+        );
+    }
+
+    #[test]
+    fn advances_by_step_and_includes_the_latest_start() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 1), 1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]);
+
+        let slot = engine
+            .find_first_slot(&relative, 0, 10, 5)
+            .unwrap()
+            .expect("the inclusive latest candidate should fit");
+
+        assert_eq!(slot.start(), 10);
+    }
+
+    #[test]
+    fn returns_none_when_no_slot_is_feasible() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        add_held_promise(&mut engine, claim(pool_id, 0, 30, 1), 1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]);
+
+        assert_eq!(engine.find_first_slot(&relative, 0, 20, 10), Ok(None));
+    }
+
+    #[test]
+    fn validates_slot_search_inputs() {
+        let (engine, pool_id) = engine_with_pool(1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 1, 1)]);
+
+        assert_eq!(
+            engine.find_first_slot(&relative, 2, 1, 1),
+            Err(DomainError::InvalidSearchRange)
+        );
+        assert_eq!(
+            engine.find_first_slot(&relative, 0, 1, 0),
+            Err(DomainError::InvalidStep)
+        );
+        assert_eq!(
+            engine.find_first_slot(&relative, 0, 1, -1),
+            Err(DomainError::InvalidStep)
+        );
+    }
+
+    #[test]
+    fn stops_safely_when_the_next_candidate_overflows() {
+        let (engine, pool_id) = engine_with_pool(0);
+        let relative = relative_bundle(vec![relative_claim(pool_id, -1, 0, 1)]);
+
+        assert_eq!(
+            engine.find_first_slot(&relative, Timestamp::MAX - 1, Timestamp::MAX, 2),
+            Ok(None)
+        );
+    }
+
+    #[test]
+    fn reports_slot_materialization_overflow() {
+        let (engine, pool_id) = engine_with_pool(1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 1, 1)]);
+
+        assert_eq!(
+            engine.find_first_slot(&relative, Timestamp::MAX, Timestamp::MAX, 1),
+            Err(DomainError::TimestampOverflow)
+        );
+    }
+
+    #[test]
+    fn finds_a_slot_across_variable_capacity() {
+        let curve = CapacityCurve::from_sorted(vec![
+            CapacitySegment::new(Interval::new(0, 10).unwrap(), 5),
+            CapacitySegment::new(Interval::new(10, 20).unwrap(), 10),
+        ])
+        .unwrap();
+        let (engine, pool_id) = engine_with_capacity_curve(curve);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 10, 6)]);
+
+        let slot = engine
+            .find_first_slot(&relative, 0, 10, 10)
+            .unwrap()
+            .expect("the higher-capacity segment should fit");
+
+        assert_eq!(slot.start(), 10);
+        assert_eq!(
+            slot.bundle().claims()[0].interval(),
+            Interval::new(10, 20).unwrap()
+        );
+    }
+
+    #[test]
+    fn searches_multiple_pools_with_relative_offsets_atomically() {
+        let (mut engine, first_pool) = engine_with_pool(1);
+        let second_pool = create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(1));
+        add_held_promise(&mut engine, claim(first_pool, 0, 5, 1), 2);
+        add_held_promise(&mut engine, claim(second_pool, 5, 10, 1), 3);
+        let relative = relative_bundle(vec![
+            relative_claim(first_pool, 0, 5, 1),
+            relative_claim(second_pool, -5, 0, 1),
+        ]);
+
+        let slot = engine
+            .find_first_slot(&relative, 0, 5, 5)
+            .unwrap()
+            .expect("the second multi-pool candidate should fit");
+
+        assert_eq!(slot.start(), 5);
+        assert_eq!(
+            slot.bundle().claims()[0].interval(),
+            Interval::new(5, 10).unwrap()
+        );
+        assert_eq!(
+            slot.bundle().claims()[1].interval(),
+            Interval::new(0, 5).unwrap()
+        );
+    }
+
+    #[test]
+    fn advisory_slot_search_does_not_mutate_state() {
+        let (engine, pool_id) = engine_with_pool(1);
+        let relative = relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]);
+        let sequence = engine.sequence();
+        let slack = engine.slack_timeline(pool_id).unwrap().clone();
+
+        assert!(
+            engine
+                .find_first_slot(&relative, 0, 10, 1)
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(engine.sequence(), sequence);
+        assert!(engine.promises.is_empty());
+        assert!(engine.events.is_empty());
+        assert_eq!(engine.slack_timeline(pool_id), Some(&slack));
+    }
+
+    #[test]
+    fn authoritative_slot_hold_publishes_the_materialized_bundle() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldFirstSlot {
+                    promise_id,
+                    relative_bundle: relative_bundle(vec![relative_claim(pool_id, -2, 3, 1)]),
+                    earliest_start: 10,
+                    latest_start: 20,
+                    step: 5,
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(
+            result,
+            CommandResult::SlotCompleted(SlotOutcome::Held {
+                promise_id,
+                start: 10,
+            })
+        );
+        assert_eq!(
+            engine.promise(promise_id).unwrap().bundle().claims()[0].interval(),
+            Interval::new(8, 13).unwrap()
+        );
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(10), Ok(0));
+        assert_eq!(engine.events.last().unwrap().kind(), EventKind::HoldCreated);
+    }
+
+    #[test]
+    fn slot_hold_processes_expirations_before_searching() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        let expired_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 1), 10, 1);
+        let promise_id = PromiseId::generate();
+        let outcome = engine
+            .hold_slot_at(
+                promise_id,
+                relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]),
+                SlotRange {
+                    earliest: 0,
+                    latest: 0,
+                    step: 1,
+                },
+                100,
+                10,
+            )
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            SlotOutcome::Held {
+                promise_id,
+                start: 0
+            }
+        );
+        assert_eq!(
+            engine.promise(expired_id).unwrap().state(),
+            PromiseState::Expired
+        );
+        assert_eq!(engine.sequence().get(), 3);
+        assert_eq!(
+            engine.events.iter().map(Event::kind).collect::<Vec<_>>(),
+            vec![EventKind::HoldExpired, EventKind::HoldCreated]
+        );
+    }
+
+    #[test]
+    fn exact_slot_retry_returns_the_cached_outcome() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        let operation = CommandOperation::HoldFirstSlot {
+            promise_id: PromiseId::generate(),
+            relative_bundle: relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]),
+            earliest_start: 0,
+            latest_start: 10,
+            step: 5,
+            expires_at: EXPIRES_AT,
+        };
+
+        let first = engine
+            .apply(command_with_key("slot", operation.clone()), NOW)
+            .unwrap();
+        let sequence = engine.sequence();
+        let event_count = engine.events.len();
+        let second = engine
+            .apply(command_with_key("slot", operation), EXPIRES_AT)
+            .unwrap();
+
+        assert_eq!(first, second);
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.events.len(), event_count);
+        assert_eq!(engine.promises.len(), 1);
+    }
+
+    #[test]
+    fn changed_slot_payload_conflicts_with_an_idempotency_key() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        let promise_id = PromiseId::generate();
+        let operation = |step| CommandOperation::HoldFirstSlot {
+            promise_id,
+            relative_bundle: relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]),
+            earliest_start: 0,
+            latest_start: 10,
+            step,
+            expires_at: EXPIRES_AT,
+        };
+
+        engine
+            .apply(command_with_key("slot", operation(5)), NOW)
+            .unwrap();
+        assert_eq!(
+            engine.apply(command_with_key("slot", operation(10)), NOW),
+            Err(DomainError::IdempotencyConflict)
+        );
+    }
+
+    #[test]
+    fn unavailable_slot_hold_reports_attempts_without_mutation() {
+        let (mut engine, pool_id) = engine_with_pool(0);
+        let sequence = engine.sequence();
+        let slack = engine.slack_timeline(pool_id).unwrap().clone();
+        let outcome = engine
+            .hold_slot_at(
+                PromiseId::generate(),
+                relative_bundle(vec![relative_claim(pool_id, 0, 10, 1)]),
+                SlotRange {
+                    earliest: 0,
+                    latest: 20,
+                    step: 10,
+                },
+                EXPIRES_AT,
+                NOW,
+            )
+            .unwrap();
+
+        assert_eq!(outcome, SlotOutcome::Unavailable { attempts: 3 });
+        assert_eq!(engine.sequence(), sequence);
+        assert!(engine.promises.is_empty());
+        assert!(engine.events.is_empty());
+        assert_eq!(engine.slack_timeline(pool_id), Some(&slack));
+    }
+
+    #[test]
+    fn public_slot_hold_uses_the_injected_clock() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        engine.clock = Box::new(FixedClock(100));
+
+        assert_eq!(
+            engine.hold_first_slot(
+                relative_bundle(vec![relative_claim(pool_id, 0, 1, 1)]),
+                0,
+                0,
+                1,
+                100,
+            ),
+            Err(DomainError::InvalidExpiration)
+        );
     }
 
     #[test]

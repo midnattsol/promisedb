@@ -19,7 +19,8 @@ Edit `src/idempotency.rs`.
 - Use `CanonicalHash` implementations or add a private implementation for the new value type.
 - Use fixed-width big-endian integers.
 - Prefix variable-length strings and collections with lengths.
-- Normalize collections only when their order is semantically irrelevant. Preserve ordered preference lists such as `Choice::alternatives`.
+- Normalize collections only when their order is semantically irrelevant. Preserve ordered preference lists such as `Choice::alternatives`. Relative-bundle claims, like ordinary bundle claims, are unordered and require a stable sort key.
+- Include search controls and deadlines in operation identity; changing bounds, step, or expiration changes the command.
 - Add a hash test proving that meaningful field changes, including preference order, alter the hash.
 - Add or update a golden vector when changing the format intentionally.
 
@@ -47,6 +48,10 @@ process expirations
 
 The idempotency wrapper caches the response after dispatch.
 
+Search-and-mutate commands must perform both phases inside this transition. An advisory query result must never be passed back into a later hold as proof of availability. Keep prepared index copies with the selected candidate and publish them through the existing transition helper.
+
+For potentially large searches, retain only bounded outcome data. Count rejected candidates rather than accumulating complete conflict vectors unless the public contract explicitly requires those conflicts.
+
 ## 5. Define audit events
 
 Edit `src/event.rs` only if existing event kinds and payloads are insufficient.
@@ -59,8 +64,9 @@ Add tests for:
 
 - canonical hash stability and field sensitivity;
 - successful dispatch;
-- structured business rejection, including every required alternative conflict;
-- failure without partial mutation across pools or rejected alternatives;
+- structured business rejection, including every required alternative conflict or bounded search attempt count;
+- inclusive search boundaries, stepping, timestamp overflow, and variable capacity when applicable;
+- failure without partial mutation across pools, rejected alternatives, or unavailable candidates;
 - exact retry without sequence or event changes;
 - same key with a different payload;
 - expiration ordering when relevant;

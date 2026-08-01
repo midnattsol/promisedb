@@ -11,6 +11,8 @@ mod claim;
 mod error;
 mod interval;
 mod promise;
+mod relative_bundle;
+mod relative_claim;
 mod resource_pool;
 mod unit;
 
@@ -21,6 +23,8 @@ pub use claim::Claim;
 pub use error::DomainError;
 pub use interval::Interval;
 pub use promise::{Promise, PromiseId, PromiseState, ReplacementState, SequenceNumber, Version};
+pub use relative_bundle::RelativeBundle;
+pub use relative_claim::RelativeClaim;
 pub use resource_pool::{ResourcePool, ResourcePoolId};
 pub use unit::Unit;
 /// An integer UTC timestamp.

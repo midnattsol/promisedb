@@ -26,8 +26,16 @@ pub enum DomainError {
     InvalidExpiration,
     /// A bundle contains no claims.
     EmptyBundle,
+    /// A relative bundle contains no claims.
+    EmptyRelativeBundle,
     /// A choice contains no alternative bundles.
     EmptyChoice,
+    /// The earliest candidate start is later than the latest candidate start.
+    InvalidSearchRange,
+    /// A slot search step is not positive.
+    InvalidStep,
+    /// Timestamp arithmetic overflowed while materializing a slot.
+    TimestampOverflow,
     /// A resource pool already exists with the same identifier.
     ResourcePoolAlreadyExists,
     /// A referenced resource pool does not exist.
@@ -71,7 +79,13 @@ impl Display for DomainError {
             Self::IndexOverflow => "derived index arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",
             Self::EmptyBundle => "bundle must contain at least one claim",
+            Self::EmptyRelativeBundle => "relative bundle must contain at least one claim",
             Self::EmptyChoice => "choice must contain at least one alternative bundle",
+            Self::InvalidSearchRange => {
+                "earliest candidate start must not be later than latest candidate start"
+            }
+            Self::InvalidStep => "slot search step must be greater than zero",
+            Self::TimestampOverflow => "timestamp arithmetic overflowed",
             Self::ResourcePoolAlreadyExists => {
                 "resource pool already exists with the same identifier"
             }

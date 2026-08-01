@@ -23,6 +23,8 @@ The domain owns validated values and local lifecycle rules:
 - `capacity_curve.rs`: ordered normalized physical capacity.
 - `claim.rs`: one positive pool demand over one interval.
 - `bundle.rs`: non-empty atomic claim collection.
+- `relative_claim.rs`: validated offsets and checked claim materialization.
+- `relative_bundle.rs`: non-empty atomic relative workflows.
 - `promise.rs`: identity, state, versions, and local transitions.
 - `resource_pool.rs`: pool identity, immutable unit, and capacity curve.
 - `error.rs`: structured domain and transition errors.
@@ -68,7 +70,7 @@ src/engine/capacity_revision.rs
 src/index/
 ```
 
-`SlackTimeline` is the admission hot path. It is reconstructible from capacity curves and active held or committed promises. Never make it the only source of truth.
+`SlackTimeline` is the admission hot path. It is reconstructible from capacity curves and active held or committed promises. First-slot search evaluates each materialized candidate against timeline copies and authoritative holds publish only the selected copies. Never make the index the only source of truth.
 
 ## Documentation ownership
 
