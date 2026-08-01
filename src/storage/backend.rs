@@ -128,7 +128,7 @@ pub enum Durability {
     Sync,
 }
 
-/// Appends owned immutable bytes and applies the requested durability policy.
+/// Appends an owned byte vector and applies the requested durability policy.
 ///
 /// Ownership prevents a caller from mutating the submitted buffer while the helper
 /// performs the policy operation. `Sync` calls [`WalBackend::sync`] directly;
@@ -139,7 +139,7 @@ pub enum Durability {
 /// Returns the first append, flush, or sync error.
 pub fn persist(
     backend: &mut impl WalBackend,
-    bytes: Box<[u8]>,
+    bytes: Vec<u8>,
     durability: Durability,
 ) -> Result<(), StorageError> {
     backend.append(&bytes)?;
@@ -158,9 +158,9 @@ mod tests {
     fn memory_wal_retains_bytes_and_counts_policy_calls() {
         let mut wal = MemoryWal::new();
 
-        persist(&mut wal, Box::from(*b"first"), Durability::None).unwrap();
-        persist(&mut wal, Box::from(*b"second"), Durability::Flush).unwrap();
-        persist(&mut wal, Box::from(*b"third"), Durability::Sync).unwrap();
+        persist(&mut wal, b"first".to_vec(), Durability::None).unwrap();
+        persist(&mut wal, b"second".to_vec(), Durability::Flush).unwrap();
+        persist(&mut wal, b"third".to_vec(), Durability::Sync).unwrap();
 
         assert_eq!(wal.bytes(), b"firstsecondthird");
         assert_eq!(wal.append_count(), 3);

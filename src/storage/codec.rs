@@ -10,6 +10,9 @@ use crate::engine::CapacityRevisionMode;
 use super::StorageError;
 
 /// Current command payload format version.
+///
+/// Version 1 is defined to use little-endian byte order for every fixed-width
+/// integer and length field.
 pub const COMMAND_FORMAT_VERSION: u8 = 1;
 
 const CREATE_POOL: u8 = 1;
@@ -24,21 +27,35 @@ const HOLD_FIRST_SLOT: u8 = 9;
 
 /// Encodes a complete command into its deterministic binary payload.
 ///
-/// The format uses explicit one-byte tags, big-endian fixed-width integers,
-/// four-byte length prefixes, and stable UUID bytes. Bundle claim order and choice
-/// alternative order are preserved exactly.
+/// Version 1 uses explicit one-byte tags, little-endian fixed-width integers,
+/// little-endian four-byte length prefixes, and stable UUID bytes. Bundle claim
+/// order and choice alternative order are preserved exactly.
 ///
 /// # Errors
 ///
 /// Returns [`StorageError::InvalidLength`] if a string or collection exceeds the
 /// format's `u32` length limit.
 pub fn encode_command(command: &Command) -> Result<Vec<u8>, StorageError> {
-    let mut writer = Writer::default();
+    let mut bytes = Vec::new();
+    encode_command_into(command, &mut bytes)?;
+    Ok(bytes)
+}
+
+/// Appends a complete command to an existing destination buffer.
+///
+/// # Errors
+///
+/// Returns [`StorageError::InvalidLength`] if a string or collection exceeds the
+/// format's `u32` length limit.
+pub(super) fn encode_command_into(
+    command: &Command,
+    destination: &mut Vec<u8>,
+) -> Result<(), StorageError> {
+    let mut writer = Writer::new(destination);
     writer.byte(COMMAND_FORMAT_VERSION);
     writer.string("client_id", command.client_id().as_str())?;
     writer.string("idempotency_key", command.idempotency_key().as_str())?;
-    writer.operation(command.operation())?;
-    Ok(writer.bytes)
+    writer.operation(command.operation())
 }
 
 /// Decodes a complete deterministic command payload.
@@ -68,26 +85,28 @@ pub fn decode_command(bytes: &[u8]) -> Result<Command, StorageError> {
     Ok(Command::new(client_id, idempotency_key, operation))
 }
 
-#[derive(Default)]
-struct Writer {
-    bytes: Vec<u8>,
+struct Writer<'a> {
+    bytes: &'a mut Vec<u8>,
 }
 
-impl Writer {
+impl<'a> Writer<'a> {
+    fn new(bytes: &'a mut Vec<u8>) -> Self {
+        Self { bytes }
+    }
     fn byte(&mut self, value: u8) {
         self.bytes.push(value);
     }
 
     fn u32(&mut self, value: u32) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn u64(&mut self, value: u64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn i64(&mut self, value: i64) {
-        self.bytes.extend_from_slice(&value.to_be_bytes());
+        self.bytes.extend_from_slice(&value.to_le_bytes());
     }
 
     fn len(&mut self, field: &'static str, length: usize) -> Result<(), StorageError> {
@@ -303,19 +322,19 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, StorageError> {
         let mut bytes = [0; 4];
         bytes.copy_from_slice(self.take(4)?);
-        Ok(u32::from_be_bytes(bytes))
+        Ok(u32::from_le_bytes(bytes))
     }
 
     fn u64(&mut self) -> Result<u64, StorageError> {
         let mut bytes = [0; 8];
         bytes.copy_from_slice(self.take(8)?);
-        Ok(u64::from_be_bytes(bytes))
+        Ok(u64::from_le_bytes(bytes))
     }
 
     fn i64(&mut self) -> Result<i64, StorageError> {
         let mut bytes = [0; 8];
         bytes.copy_from_slice(self.take(8)?);
-        Ok(i64::from_be_bytes(bytes))
+        Ok(i64::from_le_bytes(bytes))
     }
 
     fn count(&mut self, field: &'static str) -> Result<usize, StorageError> {
@@ -531,6 +550,64 @@ mod tests {
     }
 
     #[test]
+    fn command_encoding_is_byte_exact_little_endian_and_appends_to_destination() {
+        let expected = vec![
+            1, // format version
+            8,
+            0,
+            0,
+            0,
+            b'c',
+            b'l',
+            b'i',
+            b'e',
+            b'n',
+            b't',
+            b'-',
+            b'a',
+            9,
+            0,
+            0,
+            0,
+            b'r',
+            b'e',
+            b'q',
+            b'u',
+            b'e',
+            b's',
+            b't',
+            b'-',
+            b'1',
+            PROCESS_EXPIRATIONS,
+        ];
+        let command = command(CommandOperation::ProcessExpirations);
+
+        assert_eq!(encode_command(&command).unwrap(), expected);
+
+        let mut destination = vec![0xaa];
+        encode_command_into(&command, &mut destination).unwrap();
+        assert_eq!(destination[0], 0xaa);
+        assert_eq!(&destination[1..], expected);
+    }
+
+    #[test]
+    fn fixed_width_values_are_byte_exact_little_endian() {
+        let mut bytes = Vec::new();
+        let mut writer = Writer::new(&mut bytes);
+        writer.u32(0x0102_0304);
+        writer.u64(0x0102_0304_0506_0708);
+        writer.i64(0x0102_0304_0506_0708);
+
+        assert_eq!(
+            bytes,
+            [
+                0x04, 0x03, 0x02, 0x01, 0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01, 0x08, 0x07,
+                0x06, 0x05, 0x04, 0x03, 0x02, 0x01,
+            ]
+        );
+    }
+
+    #[test]
     fn every_command_variant_round_trips() {
         let commands = vec![
             command(CommandOperation::CreateResourcePool {
@@ -632,8 +709,8 @@ mod tests {
         );
 
         let mut invalid_tag = vec![COMMAND_FORMAT_VERSION];
-        invalid_tag.extend_from_slice(&0_u32.to_be_bytes());
-        invalid_tag.extend_from_slice(&0_u32.to_be_bytes());
+        invalid_tag.extend_from_slice(&0_u32.to_le_bytes());
+        invalid_tag.extend_from_slice(&0_u32.to_le_bytes());
         invalid_tag.push(255);
         assert_eq!(
             decode_command(&invalid_tag),
@@ -643,7 +720,7 @@ mod tests {
             })
         );
 
-        let invalid_utf8 = [COMMAND_FORMAT_VERSION, 0, 0, 0, 1, 0xff];
+        let invalid_utf8 = [COMMAND_FORMAT_VERSION, 1, 0, 0, 0, 0xff];
         assert_eq!(
             decode_command(&invalid_utf8),
             Err(StorageError::InvalidUtf8)
@@ -683,16 +760,16 @@ mod tests {
     #[test]
     fn rejects_decoded_domain_violations() {
         let mut encoded = vec![COMMAND_FORMAT_VERSION];
-        encoded.extend_from_slice(&0_u32.to_be_bytes());
-        encoded.extend_from_slice(&0_u32.to_be_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
+        encoded.extend_from_slice(&0_u32.to_le_bytes());
         encoded.push(HOLD);
         encoded.extend_from_slice(&[1; 16]);
-        encoded.extend_from_slice(&1_u32.to_be_bytes());
+        encoded.extend_from_slice(&1_u32.to_le_bytes());
         encoded.extend_from_slice(&[2; 16]);
-        encoded.extend_from_slice(&10_i64.to_be_bytes());
-        encoded.extend_from_slice(&10_i64.to_be_bytes());
-        encoded.extend_from_slice(&1_u64.to_be_bytes());
-        encoded.extend_from_slice(&20_i64.to_be_bytes());
+        encoded.extend_from_slice(&10_i64.to_le_bytes());
+        encoded.extend_from_slice(&10_i64.to_le_bytes());
+        encoded.extend_from_slice(&1_u64.to_le_bytes());
+        encoded.extend_from_slice(&20_i64.to_le_bytes());
 
         assert_eq!(
             decode_command(&encoded),
