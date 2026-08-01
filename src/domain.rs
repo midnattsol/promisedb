@@ -24,5 +24,5 @@ pub use unit::Unit;
 /// An integer UTC timestamp.
 pub type Timestamp = i64;
 
-/// A non-negative amount of capacity expressed in a pool's unit.
+/// A non-negative integer count of a resource pool's configured subunits.
 pub type Quantity = u64;

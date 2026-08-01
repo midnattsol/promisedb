@@ -2,7 +2,7 @@
 
 use super::{DomainError, Interval, Quantity, ResourcePoolId};
 
-/// A positive quantity requested from a resource pool during an interval.
+/// A positive integer subunit quantity requested from a pool during an interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Claim {
     pool_id: ResourcePoolId,
@@ -42,7 +42,7 @@ impl Claim {
         self.interval
     }
 
-    /// Returns the claimed quantity.
+    /// Returns the claimed quantity in the resource pool's configured subunits.
     pub fn quantity(&self) -> Quantity {
         self.quantity
     }

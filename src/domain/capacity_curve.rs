@@ -27,7 +27,7 @@ impl CapacitySegment {
         self.interval
     }
 
-    /// Returns the capacity available during the segment.
+    /// Returns available capacity in the resource pool's configured subunits.
     pub fn capacity(&self) -> Quantity {
         self.capacity
     }
