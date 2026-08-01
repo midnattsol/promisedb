@@ -7,7 +7,7 @@
 
 use super::IndexError;
 use crate::domain::{
-    CapacityCurve, Claim, Interval, Promise, PromiseState, ResourcePoolId, Timestamp,
+    CapacityCurve, Claim, Interval, Promise, PromiseState, Quantity, ResourcePoolId, Timestamp,
 };
 use std::collections::BTreeMap;
 use std::ops::Range;
@@ -16,18 +16,18 @@ use std::ops::Range;
 ///
 /// Positive values represent spare capacity, zero represents full utilization,
 /// and negative values represent a deficit created by forced capacity changes.
-pub type Slack = i128;
+pub type Slack = i64;
 
 /// A half-open interval where effective slack is negative.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlackDeficit {
     interval: Interval,
-    amount: Slack,
+    amount: Quantity,
 }
 
 impl SlackDeficit {
     /// Creates a normalized deficit interval.
-    pub fn new(interval: Interval, amount: Slack) -> Self {
+    pub fn new(interval: Interval, amount: Quantity) -> Self {
         Self { interval, amount }
     }
 
@@ -37,7 +37,7 @@ impl SlackDeficit {
     }
 
     /// Returns the positive magnitude of the deficit.
-    pub fn amount(self) -> Slack {
+    pub fn amount(self) -> Quantity {
         self.amount
     }
 }
@@ -46,7 +46,7 @@ const MAX_POINTS_PER_BLOCK: usize = 256;
 
 #[derive(Debug, Default, Clone, Copy)]
 struct TimelineEvent {
-    capacity: Option<Slack>,
+    capacity: Option<i128>,
     usage_started: u128,
     usage_ended: u128,
 }
@@ -398,7 +398,7 @@ impl SlackTimeline {
             events
                 .entry(segment.interval().start())
                 .or_default()
-                .capacity = Some(Slack::from(segment.capacity()));
+                .capacity = Some(i128::from(segment.capacity()));
             events.entry(segment.interval().end()).or_default().capacity = Some(0);
         }
 
@@ -416,7 +416,7 @@ impl SlackTimeline {
                 .ok_or(IndexError::SlackOverflow)?;
         }
 
-        let mut capacity: Slack = 0;
+        let mut capacity: i128 = 0;
         let mut usage: u128 = 0;
         let mut points = Vec::with_capacity(events.len());
 
@@ -430,10 +430,11 @@ impl SlackTimeline {
             usage = usage
                 .checked_add(event.usage_started)
                 .ok_or(IndexError::SlackOverflow)?;
-            let signed_usage = Slack::try_from(usage).map_err(|_| IndexError::SlackOverflow)?;
-            let slack = capacity
+            let signed_usage = i128::try_from(usage).map_err(|_| IndexError::SlackOverflow)?;
+            let wide_slack = capacity
                 .checked_sub(signed_usage)
                 .ok_or(IndexError::SlackOverflow)?;
+            let slack = Slack::try_from(wide_slack).map_err(|_| IndexError::SlackOverflow)?;
 
             if points
                 .last()
@@ -523,8 +524,8 @@ impl SlackTimeline {
     ///
     /// # Errors
     ///
-    /// Returns [`IndexError::SlackOverflow`] when an effective slack value or its
-    /// positive deficit magnitude cannot be represented.
+    /// Returns [`IndexError::SlackOverflow`] when an effective slack value is
+    /// inconsistent with the stored representation.
     pub fn deficit_intervals(&self) -> Result<Vec<SlackDeficit>, IndexError> {
         let points = self.effective_points()?;
         let mut deficit_per_interval: Vec<SlackDeficit> = Vec::new();
@@ -535,10 +536,7 @@ impl SlackTimeline {
             if current.slack() < 0 {
                 let interval = Interval::new(current.timestamp(), next.timestamp())
                     .map_err(|_| IndexError::InvalidPointRange)?;
-                let amount = current
-                    .slack()
-                    .checked_neg()
-                    .ok_or(IndexError::SlackOverflow)?;
+                let amount = current.slack().unsigned_abs();
                 deficit_per_interval.push(SlackDeficit::new(interval, amount));
             }
         }
@@ -808,7 +806,7 @@ impl SlackTimeline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{Bundle, CapacitySegment, PromiseId, SequenceNumber};
+    use crate::domain::{Bundle, CapacitySegment, MAX_QUANTITY, PromiseId, SequenceNumber};
 
     fn point(timestamp: Timestamp, slack: Slack) -> SlackPoint {
         SlackPoint::new(timestamp, slack)
@@ -902,6 +900,13 @@ mod tests {
         };
 
         assert_eq!(timeline.deficit_intervals(), Ok(Vec::new()));
+    }
+
+    #[cfg(target_pointer_width = "64")]
+    #[test]
+    fn compact_types_have_the_expected_64_bit_layout() {
+        assert_eq!(std::mem::size_of::<SlackPoint>(), 16);
+        assert_eq!(std::mem::size_of::<SlackBlock>(), 64);
     }
 
     #[test]
@@ -1135,6 +1140,35 @@ mod tests {
     }
 
     #[test]
+    fn stores_the_maximum_capacity_as_slack() {
+        let curve = capacity_curve(&[(0, 10, MAX_QUANTITY)]);
+        let timeline = SlackTimeline::from_capacity_curve(&curve)
+            .expect("maximum capacity should produce representable slack");
+
+        assert_eq!(timeline.slack_at(5), Ok(Slack::MAX));
+    }
+
+    #[test]
+    fn wide_rebuild_scratch_can_produce_a_representable_forced_deficit() {
+        let pool_id = ResourcePoolId::generate();
+        let curve = capacity_curve(&[(0, 10, MAX_QUANTITY)]);
+        let first = claim(pool_id, 0, 10, MAX_QUANTITY);
+        let second = claim(pool_id, 0, 10, MAX_QUANTITY);
+
+        let timeline = SlackTimeline::from_capacity_and_claims(&curve, &[&first, &second])
+            .expect("wide usage aggregation should narrow to a representable deficit");
+
+        assert_eq!(timeline.slack_at(5), Ok(-Slack::MAX));
+        assert_eq!(
+            timeline.deficit_intervals(),
+            Ok(vec![SlackDeficit::new(
+                Interval::new(0, 10).unwrap(),
+                MAX_QUANTITY,
+            )])
+        );
+    }
+
+    #[test]
     fn rebuilds_slack_from_capacity_and_active_claims() {
         let pool_id = ResourcePoolId::generate();
         let curve = capacity_curve(&[(0, 30, 10)]);
@@ -1251,7 +1285,7 @@ mod tests {
             random_state = random_state
                 .wrapping_mul(6_364_136_223_846_793_005)
                 .wrapping_add(1);
-            let mut delta = Slack::from(random_state % 11) - 5;
+            let mut delta = Slack::try_from(random_state % 11).expect("small delta should fit") - 5;
             if delta == 0 {
                 delta = 1;
             }

@@ -1,6 +1,6 @@
 //! Claims positioned relative to a candidate start timestamp.
 
-use super::{Claim, DomainError, Interval, Quantity, ResourcePoolId, Timestamp};
+use super::{Claim, DomainError, Interval, MAX_QUANTITY, Quantity, ResourcePoolId, Timestamp};
 
 /// A positive pool demand over a half-open interval relative to a candidate start.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -20,7 +20,8 @@ impl RelativeClaim {
     /// # Errors
     ///
     /// Returns [`DomainError::InvalidInterval`] when `start_offset >= end_offset`,
-    /// or [`DomainError::InvalidQuantity`] when `quantity` is zero.
+    /// [`DomainError::InvalidQuantity`] when `quantity` is zero, or
+    /// [`DomainError::QuantityOutOfRange`] when it exceeds [`MAX_QUANTITY`].
     pub fn new(
         pool_id: ResourcePoolId,
         start_offset: i64,
@@ -32,6 +33,9 @@ impl RelativeClaim {
         }
         if quantity == 0 {
             return Err(DomainError::InvalidQuantity);
+        }
+        if quantity > MAX_QUANTITY {
+            return Err(DomainError::QuantityOutOfRange);
         }
 
         Ok(Self {
@@ -101,6 +105,18 @@ mod tests {
             RelativeClaim::new(pool_id, -2, 3, 0),
             Err(DomainError::InvalidQuantity)
         );
+        assert_eq!(
+            RelativeClaim::new(pool_id, -2, 3, MAX_QUANTITY + 1),
+            Err(DomainError::QuantityOutOfRange)
+        );
+    }
+
+    #[test]
+    fn accepts_the_maximum_quantity() {
+        let claim = RelativeClaim::new(ResourcePoolId::generate(), -2, 3, MAX_QUANTITY)
+            .expect("the maximum quantity should be valid");
+
+        assert_eq!(claim.quantity(), MAX_QUANTITY);
     }
 
     #[test]

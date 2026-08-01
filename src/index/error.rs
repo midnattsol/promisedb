@@ -10,7 +10,7 @@ pub enum IndexError {
     UnsortedSlackPoints,
     /// Two slack points have the same timestamp.
     DuplicateSlackTimestamp,
-    /// Slack arithmetic exceeded the representable `i128` range.
+    /// Stored slack arithmetic exceeded the representable `i64` range.
     SlackOverflow,
     /// A point range is reversed or extends beyond its block.
     InvalidPointRange,

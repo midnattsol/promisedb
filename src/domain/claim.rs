@@ -1,6 +1,6 @@
 //! Time-bounded claims against resource pools.
 
-use super::{DomainError, Interval, Quantity, ResourcePoolId};
+use super::{DomainError, Interval, MAX_QUANTITY, Quantity, ResourcePoolId};
 
 /// A positive integer subunit quantity requested from a pool during an interval.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -15,7 +15,8 @@ impl Claim {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::InvalidQuantity`] when `quantity` is zero.
+    /// Returns [`DomainError::InvalidQuantity`] when `quantity` is zero, or
+    /// [`DomainError::QuantityOutOfRange`] when it exceeds [`MAX_QUANTITY`].
     pub fn new(
         pool_id: ResourcePoolId,
         interval: Interval,
@@ -23,6 +24,9 @@ impl Claim {
     ) -> Result<Self, DomainError> {
         if quantity == 0 {
             return Err(DomainError::InvalidQuantity);
+        }
+        if quantity > MAX_QUANTITY {
+            return Err(DomainError::QuantityOutOfRange);
         }
 
         Ok(Self {
@@ -72,5 +76,24 @@ mod tests {
         let result = Claim::new(ResourcePoolId::generate(), valid_interval(), 0);
 
         assert_eq!(result, Err(DomainError::InvalidQuantity));
+    }
+
+    #[test]
+    fn accepts_the_maximum_quantity() {
+        let claim = Claim::new(ResourcePoolId::generate(), valid_interval(), MAX_QUANTITY)
+            .expect("the maximum quantity should be valid");
+
+        assert_eq!(claim.quantity(), MAX_QUANTITY);
+    }
+
+    #[test]
+    fn rejects_a_quantity_above_the_maximum() {
+        let result = Claim::new(
+            ResourcePoolId::generate(),
+            valid_interval(),
+            MAX_QUANTITY + 1,
+        );
+
+        assert_eq!(result, Err(DomainError::QuantityOutOfRange));
     }
 }

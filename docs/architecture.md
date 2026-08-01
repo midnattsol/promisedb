@@ -50,7 +50,11 @@ A rejected operation does not consume its own sequence. Expirations successfully
 
 Indexes accelerate decisions but are not authoritative. `SlackTimeline` is derived from a pool's `CapacityCurve` and the claims of held and committed promises.
 
-The index uses chronologically ordered slack points grouped into bounded blocks. Blocks maintain minimum and maximum effective slack plus a lazy block-wide delta. Complete blocks can be queried or adjusted without visiting each point.
+The index uses an array-of-structs (AoS) design: chronologically ordered `SlackPoint` values are grouped into bounded `SlackBlock` values. Blocks maintain minimum and maximum effective slack plus a lazy block-wide delta. Complete blocks can be queried or adjusted without visiting each point.
+
+Stored slack is `i64`, matching the domain's `MAX_QUANTITY = i64::MAX as u64` bound. On x86_64, measurements enforced by a layout test show that changing stored slack from `i128` to `i64` reduces `SlackPoint` from 32 to 16 bytes and `SlackBlock` from 112 to 64 bytes. This improves point density and reduces aggregate metadata footprint on the timeline hot path. Candidate demand aggregation, rebuild usage calculations, and admission comparisons still use `i128` scratch arithmetic; values are narrowed with checked conversions only when a conflict-free timeline is materialized.
+
+The current blocked AoS representation remains deliberately intact. Splitting hot and cold block metadata or switching points to a structure-of-arrays (SoA) layout could improve particular scans, but would also add indirection and complexity to updates. Those changes are benchmark-driven follow-up work, not assumptions built into this compaction.
 
 The engine creates a timeline with each resource pool and keeps it synchronized with promise transitions. A hold consumes slack, while release and expiration restore it. Commit does not adjust slack because both held and committed promises consume the same capacity.
 

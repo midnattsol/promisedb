@@ -18,6 +18,8 @@ pub enum DomainError {
     InvalidUnitScale,
     /// A claim has a zero quantity.
     InvalidQuantity,
+    /// A claim quantity or capacity exceeds the supported numeric bound.
+    QuantityOutOfRange,
     /// Capacity or usage arithmetic overflowed.
     QuantityOverflow,
     /// A derived index value cannot be represented without overflowing.
@@ -75,6 +77,7 @@ impl Display for DomainError {
             Self::InvalidUnitName => "unit name must not be empty",
             Self::InvalidUnitScale => "subunits per unit must be greater than zero",
             Self::InvalidQuantity => "quantity must be greater than zero",
+            Self::QuantityOutOfRange => "quantity exceeds the supported numeric bound",
             Self::QuantityOverflow => "capacity or usage arithmetic overflowed",
             Self::IndexOverflow => "derived index arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",

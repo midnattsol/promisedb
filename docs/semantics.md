@@ -14,7 +14,7 @@ Intervals are always half-open:
 
 ## Quantity and slack
 
-`Quantity` is a non-negative `u64` containing integer subunits. Claim quantities must be greater than zero. Capacity may be zero.
+`Quantity` remains a non-negative `u64` containing integer subunits, but supported claim quantities and capacity values are bounded by the exported `MAX_QUANTITY = i64::MAX as u64`. Claim quantities must be in `1..=MAX_QUANTITY`; capacity may be zero but must not exceed `MAX_QUANTITY`. Constructors return the structured `QuantityOutOfRange` domain error for larger values.
 
 Each resource pool has an immutable `Unit { name, subunits_per_unit }`. For a unit named `watts` with `1_000` subunits per unit, quantity `1_500` represents 1.5 watts. Unit names must not be empty and the scale must be greater than zero. Decimal parsing, display formatting, and unit aliases belong to the control API; the engine operates only on integer subunits.
 
@@ -24,7 +24,7 @@ Slack is signed:
 slack = capacity - active usage
 ```
 
-Positive slack is spare capacity, zero is full utilization, and negative slack is a deficit. The derived slack index uses `i128` so every difference between two `u64` values is representable.
+Positive slack is spare capacity, zero is full utilization, and negative slack is a deficit. The derived slack index stores `Slack` as `i64`. Rebuild and admission paths aggregate usage and candidate demand in `i128`, compare against widened base slack, and narrow only representable final values with checked conversions.
 
 ## Capacity
 
@@ -48,7 +48,7 @@ A claim consumes a positive quantity from one resource pool during one interval.
 
 A `RelativeClaim` contains a pool ID, half-open start and end offsets, and a positive quantity. Offsets may be negative, but the start offset must be less than the end offset. A `RelativeBundle` is non-empty. Materializing it at candidate start `s` translates each endpoint with checked `i64` addition, then constructs ordinary validated `Interval`, `Claim`, and `Bundle` values. Unrepresentable endpoints return `TimestampOverflow`.
 
-Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together. Choice order is significant: alternatives are evaluated from index zero and the first feasible bundle is selected.
+Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together in `i128`, so aggregate candidate demand may exceed `i64::MAX` even though each claim is bounded. Aggregate demand above available slack is a normal unavailable result, not an index overflow, as long as the public conflict quantities remain representable as `u64`. Choice order is significant: alternatives are evaluated from index zero and the first feasible bundle is selected.
 
 ## Hold admission
 
@@ -63,7 +63,7 @@ Insufficient capacity is not an engine error. An unavailable outcome contains ev
 
 Conflicts are ordered canonically by interval start, resource pool ID, and interval end. Adjacent conflicts within one pool are merged only when their quantities and conflicting promise IDs are identical. Capacity gaps are reported as zero availability.
 
-Unavailable holds do not create a promise, modify a timeline, or consume a sequence for the requested hold. Expirations processed before admission remain committed.
+Admission first evaluates disjoint demand intervals against the immutable base timeline using widened arithmetic and collects conflicts and prospective adjustments. Only a conflict-free result clones the timeline, narrows adjustments to stored `Slack`, and materializes them. Unavailable holds therefore do not create a promise, modify a timeline, or consume a sequence for the requested hold. Expirations processed before admission remain committed.
 
 `HoldOneOf` applies the same admission rules to an ordered `Choice`, using one control-plane `PromiseId` and one `expires_at`. It stops at the first feasible alternative and creates exactly one promise containing that complete bundle. Rejected alternatives publish no promise, timeline, sequence, or event changes; prepared timeline copies are discarded.
 

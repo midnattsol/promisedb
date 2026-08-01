@@ -25,7 +25,7 @@ use crate::domain::{
 };
 use crate::event::{Event, EventData, EventKind};
 use crate::idempotency::{IdempotencyRecord, hash_operation};
-use crate::index::SlackTimeline;
+use crate::index::{Slack, SlackTimeline};
 use std::collections::BTreeMap;
 
 /// The result of evaluating candidate claims against one resource pool.
@@ -1242,7 +1242,6 @@ impl Engine {
         base_timeline: &SlackTimeline,
         deficit_floor: Option<&SlackTimeline>,
     ) -> Result<PoolAdmission, DomainError> {
-        let mut slack_timeline = base_timeline.clone();
         let mut demand_events: Vec<(Timestamp, i128)> = Vec::new();
 
         for claim in candidate_claims {
@@ -1252,7 +1251,7 @@ impl Engine {
             demand_events.push((interval.end(), -quantity));
         }
 
-        for point in slack_timeline
+        for point in base_timeline
             .effective_points()
             .map_err(|_| DomainError::IndexOverflow)?
         {
@@ -1281,6 +1280,7 @@ impl Engine {
         }
 
         let mut conflicts: Vec<AvailabilityConflict> = Vec::new();
+        let mut adjustments: Vec<(Interval, i128)> = Vec::new();
         let mut current_demand: i128 = 0;
 
         for window in normalized_events.windows(2) {
@@ -1294,17 +1294,20 @@ impl Engine {
             }
 
             let interval = Interval::new(window[0].0, window[1].0)?;
-            let slack = slack_timeline
+            let slack = base_timeline
                 .slack_at(interval.start())
                 .map_err(|_| DomainError::IndexOverflow)?;
-            let final_slack = slack
+            let wide_slack = i128::from(slack);
+            let final_slack = wide_slack
                 .checked_sub(current_demand)
-                .ok_or(DomainError::IndexOverflow)?;
+                .ok_or(DomainError::QuantityOverflow)?;
             let minimum_allowed_slack = match deficit_floor {
-                Some(timeline) => timeline
-                    .slack_at(interval.start())
-                    .map_err(|_| DomainError::IndexOverflow)?
-                    .min(0),
+                Some(timeline) => i128::from(
+                    timeline
+                        .slack_at(interval.start())
+                        .map_err(|_| DomainError::IndexOverflow)?
+                        .min(0),
+                ),
                 None => 0,
             };
             let available_quantity = if slack <= 0 {
@@ -1351,16 +1354,30 @@ impl Engine {
                 }
             }
 
+            adjustments.push((interval, current_demand));
+        }
+
+        if !conflicts.is_empty() {
+            return Ok(PoolAdmission::Unavailable(conflicts));
+        }
+
+        let adjustments: Vec<(Interval, Slack)> = adjustments
+            .into_iter()
+            .map(|(interval, demand)| {
+                Slack::try_from(demand)
+                    .map(|demand| (interval, demand))
+                    .map_err(|_| DomainError::IndexOverflow)
+            })
+            .collect::<Result<_, _>>()?;
+        let mut slack_timeline = base_timeline.clone();
+        for (interval, demand) in adjustments {
+            let delta = demand.checked_neg().ok_or(DomainError::IndexOverflow)?;
             slack_timeline
-                .apply_delta(interval, -current_demand)
+                .apply_delta(interval, delta)
                 .map_err(|_| DomainError::IndexOverflow)?;
         }
 
-        if conflicts.is_empty() {
-            Ok(PoolAdmission::Available(slack_timeline))
-        } else {
-            Ok(PoolAdmission::Unavailable(conflicts))
-        }
+        Ok(PoolAdmission::Available(slack_timeline))
     }
 
     /// Evaluates every pool in a bundle against current engine timelines.
@@ -1441,8 +1458,7 @@ impl Engine {
             .into_iter()
             .map(|deficit| {
                 let interval = deficit.interval();
-                let quantity =
-                    Quantity::try_from(deficit.amount()).map_err(|_| DomainError::IndexOverflow)?;
+                let quantity = deficit.amount();
                 let affected_promise_ids = self
                     .promises
                     .iter()
@@ -1492,8 +1508,10 @@ impl Engine {
                 .ok_or(DomainError::ResourcePoolNotFound)?
                 .clone();
             for claim in claims {
+                let quantity =
+                    Slack::try_from(claim.quantity()).map_err(|_| DomainError::IndexOverflow)?;
                 timeline
-                    .apply_delta(claim.interval(), i128::from(claim.quantity()))
+                    .apply_delta(claim.interval(), quantity)
                     .map_err(|_| DomainError::IndexOverflow)?;
             }
             restored_timelines.insert(pool_id, timeline);
@@ -1512,7 +1530,7 @@ impl Default for Engine {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::domain::{CapacitySegment, RelativeClaim};
+    use crate::domain::{CapacitySegment, MAX_QUANTITY, RelativeClaim};
 
     const NOW: Timestamp = 0;
     const EXPIRES_AT: Timestamp = 1_000;
@@ -3032,6 +3050,29 @@ mod tests {
     }
 
     #[test]
+    fn forced_capacity_revision_supports_the_maximum_deficit() {
+        let (mut engine, pool_id) = engine_with_pool(MAX_QUANTITY);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, MAX_QUANTITY), 1);
+
+        let outcome = engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(0),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the maximum representable deficit should be supported");
+
+        assert_eq!(outcome.deficits().len(), 1);
+        assert_eq!(outcome.deficits()[0].quantity(), MAX_QUANTITY);
+        assert_eq!(outcome.deficits()[0].affected_promise_ids(), &[promise_id]);
+        assert_eq!(
+            engine.slack_timeline(pool_id).unwrap().slack_at(5),
+            Ok(-Slack::MAX)
+        );
+    }
+
+    #[test]
     fn strict_capacity_increase_applies_without_deficits() {
         let (mut engine, pool_id) = engine_with_pool(10);
         add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
@@ -3735,6 +3776,31 @@ mod tests {
         assert_eq!(conflicts[0].required_quantity(), 7);
         assert_eq!(conflicts[0].available_quantity(), 6);
         assert_eq!(conflicts[0].deficit_quantity(), 1);
+    }
+
+    #[test]
+    fn aggregate_demand_above_i64_max_is_unavailable_without_mutation() {
+        let (mut engine, pool_id) = engine_with_pool(MAX_QUANTITY);
+        let candidate = bundle(vec![
+            claim(pool_id, 0, 10, MAX_QUANTITY),
+            claim(pool_id, 0, 10, 1),
+        ]);
+        let original_timeline = engine.slack_timeline(pool_id).unwrap().clone();
+
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("wide aggregate demand should be a normal admission result");
+        let HoldOutcome::Unavailable { conflicts } = outcome else {
+            panic!("demand above maximum slack should be unavailable");
+        };
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(conflicts[0].required_quantity(), MAX_QUANTITY + 1);
+        assert_eq!(conflicts[0].available_quantity(), MAX_QUANTITY);
+        assert_eq!(conflicts[0].deficit_quantity(), 1);
+        assert_eq!(engine.slack_timeline(pool_id), Some(&original_timeline));
+        assert!(engine.promises.is_empty());
+        assert_eq!(engine.sequence().get(), 0);
     }
 
     #[test]

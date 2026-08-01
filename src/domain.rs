@@ -31,4 +31,10 @@ pub use unit::Unit;
 pub type Timestamp = i64;
 
 /// A non-negative integer count of a resource pool's configured subunits.
+///
+/// Valid claim quantities and capacity values are bounded by [`MAX_QUANTITY`]
+/// so their signed slack representation remains lossless.
 pub type Quantity = u64;
+
+/// The largest supported claim quantity or capacity value.
+pub const MAX_QUANTITY: Quantity = i64::MAX as Quantity;

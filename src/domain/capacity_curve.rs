@@ -4,7 +4,7 @@
 //! half-open interval. A capacity curve owns the ordered, normalized segments
 //! that describe how a resource pool's capacity changes over time.
 use super::Timestamp;
-use super::{DomainError, Interval, Quantity};
+use super::{DomainError, Interval, MAX_QUANTITY, Quantity};
 
 /// A constant amount of capacity available during one interval.
 ///
@@ -59,10 +59,12 @@ impl CapacityCurve {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::UnsortedCapacitySegments`] when interval starts are
-    /// not in chronological order, or
+    /// Returns [`DomainError::QuantityOutOfRange`] when any capacity exceeds
+    /// [`MAX_QUANTITY`], [`DomainError::UnsortedCapacitySegments`] when interval
+    /// starts are not in chronological order, or
     /// [`DomainError::OverlappingCapacitySegments`] when two segments overlap.
     pub fn from_sorted(segments: Vec<CapacitySegment>) -> Result<Self, DomainError> {
+        Self::validate_capacities(&segments)?;
         let segments = Self::normalize_sorted(segments)?;
         Ok(Self { segments })
     }
@@ -74,9 +76,11 @@ impl CapacityCurve {
     ///
     /// # Errors
     ///
-    /// Returns [`DomainError::OverlappingCapacitySegments`] when two segments
-    /// overlap.
+    /// Returns [`DomainError::QuantityOutOfRange`] when any capacity exceeds
+    /// [`MAX_QUANTITY`], or [`DomainError::OverlappingCapacitySegments`] when two
+    /// segments overlap.
     pub fn from_unsorted(mut segments: Vec<CapacitySegment>) -> Result<Self, DomainError> {
+        Self::validate_capacities(&segments)?;
         segments.sort_by_key(|segment| {
             (
                 segment.interval().start(),
@@ -86,6 +90,16 @@ impl CapacityCurve {
         });
 
         Self::from_sorted(segments)
+    }
+
+    fn validate_capacities(segments: &[CapacitySegment]) -> Result<(), DomainError> {
+        if segments
+            .iter()
+            .any(|segment| segment.capacity() > MAX_QUANTITY)
+        {
+            return Err(DomainError::QuantityOutOfRange);
+        }
+        Ok(())
     }
 
     fn normalize_sorted(
@@ -165,6 +179,29 @@ mod tests {
         let curve = CapacityCurve::empty();
 
         assert!(curve.segments().is_empty());
+    }
+
+    #[test]
+    fn accepts_the_maximum_capacity() {
+        let curve = CapacityCurve::from_sorted(vec![segment(0, 100, MAX_QUANTITY)])
+            .expect("the maximum capacity should be valid");
+
+        assert_eq!(curve.capacity_at(50), MAX_QUANTITY);
+    }
+
+    #[test]
+    fn constructors_reject_out_of_range_capacity_before_normalizing() {
+        let sorted = vec![segment(0, 100, 1), segment(100, 200, MAX_QUANTITY + 1)];
+        let unsorted = vec![segment(100, 200, MAX_QUANTITY + 1), segment(0, 150, 1)];
+
+        assert_eq!(
+            CapacityCurve::from_sorted(sorted),
+            Err(DomainError::QuantityOutOfRange)
+        );
+        assert_eq!(
+            CapacityCurve::from_unsorted(unsorted),
+            Err(DomainError::QuantityOutOfRange)
+        );
     }
 
     #[test]
