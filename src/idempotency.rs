@@ -188,19 +188,22 @@ impl CommandHash {
     }
 }
 
+/// A response cached for an idempotent command retry.
+pub type CommandResponse = Result<CommandResult, crate::domain::DomainError>;
+
 /// The data retained to answer an exact command retry.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct IdempotencyRecord {
     command_hash: CommandHash,
-    result: CommandResult,
+    response: CommandResponse,
 }
 
 impl IdempotencyRecord {
-    /// Creates a record from a normalized command hash and its original result.
-    pub fn new(command_hash: CommandHash, result: CommandResult) -> Self {
+    /// Creates a record from a normalized command hash and its original response.
+    pub fn new(command_hash: CommandHash, response: CommandResponse) -> Self {
         Self {
             command_hash,
-            result,
+            response,
         }
     }
 
@@ -209,9 +212,9 @@ impl IdempotencyRecord {
         self.command_hash
     }
 
-    /// Returns the original result cached for exact retries.
-    pub fn result(&self) -> &CommandResult {
-        &self.result
+    /// Returns the original response cached for exact retries.
+    pub fn response(&self) -> &CommandResponse {
+        &self.response
     }
 }
 
@@ -342,6 +345,17 @@ mod tests {
         };
 
         assert_ne!(hash_operation(&first), hash_operation(&changed));
+    }
+
+    #[test]
+    fn process_expirations_hash_is_stable() {
+        assert_eq!(
+            hash_operation(&CommandOperation::ProcessExpirations).as_bytes(),
+            &[
+                88, 184, 95, 131, 65, 71, 100, 252, 161, 90, 142, 141, 78, 131, 136, 247, 6, 163,
+                158, 52, 193, 103, 42, 6, 131, 30, 117, 226, 191, 197, 143, 113,
+            ]
+        );
     }
 
     #[test]

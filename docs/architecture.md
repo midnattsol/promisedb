@@ -22,6 +22,8 @@ The domain owns structural invariants for intervals, claims, bundles, promises, 
 
 The control API generates entity IDs, resolves external names, and wraps every mutation with a `ClientId` and `IdempotencyKey`. It then submits a deterministic `CommandOperation` through `Engine::apply(command, now)`. The explicit timestamp is selected outside the state machine and reused during replay.
 
+Before dispatch, the engine hashes the normalized operation with BLAKE3 and looks up `(ClientId, IdempotencyKey)` in a deterministic map. Exact retries return the cached response immediately; conflicting payloads are rejected. The map stores a fixed-size command digest and complete response, and is authoritative state required by snapshots and recovery.
+
 Commands are intended to be the future WAL recovery input. Stable events are derived audit facts exposed by `watch_events(from_sequence)`. One requested command may first emit multiple expiration events; each successful state transition owns one sequence, while multiple audit events describing one capacity revision may share that transition sequence.
 
 Queries such as `explain_unavailable` and `list_at_risk` are pure current-state reads. Deadline processing occurs before mutating commands or through `ProcessExpirations`.
@@ -66,6 +68,7 @@ The current authoritative in-memory state is:
 resource pools and capacity curves
 promises and their bundles
 promise states and versions
+idempotency command hashes and cached responses
 global sequence number
 ```
 

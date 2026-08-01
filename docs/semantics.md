@@ -88,7 +88,9 @@ Due expirations are processed before each mutating command. Commit at or after t
 
 Every internal mutation is represented by a `Command` containing a common `(ClientId, IdempotencyKey)` pair and one `CommandOperation`. The control API generates resource-pool and promise IDs before command application. `Engine::apply(command, now)` therefore uses neither randomness nor the system clock.
 
-The command model carries idempotency identity, but duplicate detection and response caching are implemented by the later idempotency milestone. Reusing a key is not yet prevented by this phase.
+The pair `(ClientId, IdempotencyKey)` identifies one command. PromiseDB hashes the normalized `CommandOperation` with BLAKE3 and caches its complete original response. An exact retry returns that response without processing expirations, consuming a sequence, emitting events, or inspecting current state. Reusing the pair with a different normalized operation returns `IdempotencyConflict`.
+
+Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing.
 
 A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
 

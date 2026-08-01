@@ -20,7 +20,7 @@ use crate::domain::{
     ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
 use crate::event::{Event, EventData, EventKind};
-use crate::idempotency::IdempotencyRecord;
+use crate::idempotency::{IdempotencyRecord, hash_operation};
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
 
@@ -119,17 +119,44 @@ impl Engine {
     ///
     /// Keeping `now` outside [`Command`] prevents clients from choosing state-machine
     /// time while allowing replay to reuse the original authoritative timestamp.
+    /// Exact retries return their cached response before inspecting `now` or state.
     ///
     /// # Errors
     ///
-    /// Returns the same operation-specific domain errors as the delegated
-    /// deterministic transition.
+    /// Returns [`DomainError::IdempotencyConflict`] when a client reuses a key for a
+    /// different normalized operation, or the original operation-specific error.
     pub fn apply(
         &mut self,
         command: Command,
         now: Timestamp,
     ) -> Result<CommandResult, DomainError> {
-        match command.into_operation() {
+        let command_hash = hash_operation(command.operation());
+        let idempotency_identity = (
+            command.client_id().clone(),
+            command.idempotency_key().clone(),
+        );
+
+        if let Some(record) = self.idempotency_records.get(&idempotency_identity) {
+            if record.command_hash() != command_hash {
+                return Err(DomainError::IdempotencyConflict);
+            }
+            return record.response().clone();
+        }
+
+        let response = self.apply_once(command.into_operation(), now);
+        self.idempotency_records.insert(
+            idempotency_identity,
+            IdempotencyRecord::new(command_hash, response.clone()),
+        );
+        response
+    }
+
+    fn apply_once(
+        &mut self,
+        operation: CommandOperation,
+        now: Timestamp,
+    ) -> Result<CommandResult, DomainError> {
+        match operation {
             CommandOperation::CreateResourcePool {
                 resource_pool_id,
                 display_name,
@@ -1307,12 +1334,16 @@ mod tests {
         Bundle::new(claims).expect("the bundle should be valid")
     }
 
-    fn command(operation: CommandOperation) -> Command {
+    fn command_with_key(key: &str, operation: CommandOperation) -> Command {
         Command::new(
             crate::command::ClientId::new("test-client"),
-            crate::command::IdempotencyKey::new(format!("command-{operation:?}")),
+            crate::command::IdempotencyKey::new(key),
             operation,
         )
+    }
+
+    fn command(operation: CommandOperation) -> Command {
+        command_with_key(&format!("command-{operation:?}"), operation)
     }
 
     fn add_held_promise_at(
@@ -1478,6 +1509,256 @@ mod tests {
             ]
         );
         assert_eq!(engine.sequence().get(), 6);
+    }
+
+    #[test]
+    fn exact_hold_retry_returns_the_original_response_without_reapplying() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        let operation = CommandOperation::Hold {
+            promise_id,
+            bundle: bundle(vec![claim(pool_id, 0, 10, 4)]),
+            expires_at: EXPIRES_AT,
+        };
+
+        let first = engine
+            .apply(command_with_key("hold-1", operation.clone()), NOW)
+            .expect("the first hold should succeed");
+        let sequence = engine.sequence();
+        let event_count = engine.events.len();
+        let second = engine
+            .apply(command_with_key("hold-1", operation), EXPIRES_AT)
+            .expect("the retry should return its cached success");
+
+        assert_eq!(first, second);
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.events.len(), event_count);
+        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.idempotency_record_count(), 1);
+    }
+
+    #[test]
+    fn reordered_bundle_claims_are_the_same_idempotent_operation() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        let first_claim = claim(pool_id, 0, 5, 2);
+        let second_claim = claim(pool_id, 5, 10, 3);
+        let first = CommandOperation::Hold {
+            promise_id,
+            bundle: bundle(vec![first_claim.clone(), second_claim.clone()]),
+            expires_at: EXPIRES_AT,
+        };
+        let reordered = CommandOperation::Hold {
+            promise_id,
+            bundle: bundle(vec![second_claim, first_claim]),
+            expires_at: EXPIRES_AT,
+        };
+
+        let original = engine
+            .apply(command_with_key("ordered-hold", first), NOW)
+            .unwrap();
+        let retry = engine
+            .apply(command_with_key("ordered-hold", reordered), NOW)
+            .unwrap();
+
+        assert_eq!(original, retry);
+        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn idempotency_keys_are_scoped_by_client() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let first = Command::new(
+            crate::command::ClientId::new("first-client"),
+            crate::command::IdempotencyKey::new("shared-key"),
+            CommandOperation::Hold {
+                promise_id: PromiseId::generate(),
+                bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+                expires_at: EXPIRES_AT,
+            },
+        );
+        let second = Command::new(
+            crate::command::ClientId::new("second-client"),
+            crate::command::IdempotencyKey::new("shared-key"),
+            CommandOperation::Hold {
+                promise_id: PromiseId::generate(),
+                bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+                expires_at: EXPIRES_AT,
+            },
+        );
+
+        engine.apply(first, NOW).unwrap();
+        engine.apply(second, NOW).unwrap();
+
+        assert_eq!(engine.promises.len(), 2);
+        assert_eq!(engine.idempotency_record_count(), 2);
+    }
+
+    #[test]
+    fn reusing_an_idempotency_key_with_another_payload_is_rejected() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        engine
+            .apply(
+                command_with_key(
+                    "conflicting-hold",
+                    CommandOperation::Hold {
+                        promise_id,
+                        bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+                        expires_at: EXPIRES_AT,
+                    },
+                ),
+                NOW,
+            )
+            .unwrap();
+        let sequence = engine.sequence();
+        let event_count = engine.events.len();
+
+        let result = engine.apply(
+            command_with_key(
+                "conflicting-hold",
+                CommandOperation::Hold {
+                    promise_id,
+                    bundle: bundle(vec![claim(pool_id, 0, 10, 2)]),
+                    expires_at: EXPIRES_AT,
+                },
+            ),
+            NOW,
+        );
+
+        assert_eq!(result, Err(DomainError::IdempotencyConflict));
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.events.len(), event_count);
+    }
+
+    #[test]
+    fn duplicate_commit_and_release_return_their_original_versions() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        engine
+            .apply(
+                command_with_key(
+                    "hold-before-transitions",
+                    CommandOperation::Hold {
+                        promise_id,
+                        bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+                        expires_at: EXPIRES_AT,
+                    },
+                ),
+                NOW,
+            )
+            .unwrap();
+        let held_version = engine.promise(promise_id).unwrap().version();
+        let commit = CommandOperation::Commit {
+            promise_id,
+            expected_version: held_version,
+        };
+        let committed = engine
+            .apply(command_with_key("commit-once", commit.clone()), NOW)
+            .unwrap();
+        let committed_retry = engine
+            .apply(command_with_key("commit-once", commit), NOW)
+            .unwrap();
+        assert_eq!(committed, committed_retry);
+
+        let committed_version = engine.promise(promise_id).unwrap().version();
+        let release = CommandOperation::Release {
+            promise_id,
+            expected_version: committed_version,
+        };
+        let released = engine
+            .apply(command_with_key("release-once", release.clone()), NOW)
+            .unwrap();
+        let sequence = engine.sequence();
+        let released_retry = engine
+            .apply(command_with_key("release-once", release), NOW)
+            .unwrap();
+
+        assert_eq!(released, released_retry);
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.promise(promise_id).unwrap().version().get(), 3);
+    }
+
+    #[test]
+    fn an_error_response_is_stable_after_state_changes() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = PromiseId::generate();
+        let expected_version = Promise::with_id(
+            promise_id,
+            bundle(vec![claim(pool_id, 20, 30, 1)]),
+            EXPIRES_AT,
+            NOW,
+            SequenceNumber::new(1),
+        )
+        .unwrap()
+        .version();
+        let missing_commit = CommandOperation::Commit {
+            promise_id,
+            expected_version,
+        };
+
+        let first = engine.apply(
+            command_with_key("missing-commit", missing_commit.clone()),
+            NOW,
+        );
+        assert_eq!(first, Err(DomainError::PromiseNotFound));
+        engine
+            .apply(
+                command_with_key(
+                    "create-missing-promise",
+                    CommandOperation::Hold {
+                        promise_id,
+                        bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+                        expires_at: EXPIRES_AT,
+                    },
+                ),
+                NOW,
+            )
+            .unwrap();
+
+        let retry = engine.apply(command_with_key("missing-commit", missing_commit), NOW);
+
+        assert_eq!(retry, Err(DomainError::PromiseNotFound));
+        assert!(matches!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Held { .. }
+        ));
+    }
+
+    #[test]
+    fn unavailable_hold_response_is_cached() {
+        let (mut engine, pool_id) = engine_with_pool(0);
+        let promise_id = PromiseId::generate();
+        let operation = CommandOperation::Hold {
+            promise_id,
+            bundle: bundle(vec![claim(pool_id, 0, 10, 1)]),
+            expires_at: EXPIRES_AT,
+        };
+        let first = engine
+            .apply(command_with_key("unavailable-hold", operation.clone()), NOW)
+            .expect("unavailability should be a normal response");
+        assert!(matches!(
+            first,
+            CommandResult::HoldCompleted(HoldOutcome::Unavailable { .. })
+        ));
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(1),
+                CapacityRevisionMode::Strict,
+                NOW,
+            )
+            .unwrap();
+        let sequence = engine.sequence();
+
+        let retry = engine
+            .apply(command_with_key("unavailable-hold", operation), NOW)
+            .expect("the original unavailability should be returned");
+
+        assert_eq!(retry, first);
+        assert_eq!(engine.sequence(), sequence);
+        assert!(engine.promise(promise_id).is_none());
     }
 
     #[test]
