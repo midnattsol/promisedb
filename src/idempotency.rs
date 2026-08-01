@@ -1,8 +1,181 @@
 //! Deterministic command hashing and cached idempotency responses.
 
 use crate::command::{CommandOperation, CommandResult};
+use crate::domain::{
+    Bundle, CapacityCurve, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId, Version,
+};
+use crate::engine::CapacityRevisionMode;
 
 const COMMAND_HASH_DOMAIN: &[u8] = b"promisedb-command-v1\0";
+
+trait CanonicalHash {
+    fn update_hash(&self, hasher: &mut blake3::Hasher);
+}
+
+fn update_length(length: usize, hasher: &mut blake3::Hasher) {
+    hasher.update(&(length as u64).to_be_bytes());
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OperationTag {
+    CreateResourcePool = 1,
+    ReviseCapacity = 2,
+    Hold = 3,
+    Commit = 4,
+    Release = 5,
+    Replace = 6,
+    ProcessExpirations = 7,
+}
+
+impl OperationTag {
+    fn for_operation(operation: &CommandOperation) -> Self {
+        match operation {
+            CommandOperation::CreateResourcePool { .. } => Self::CreateResourcePool,
+            CommandOperation::ReviseCapacity { .. } => Self::ReviseCapacity,
+            CommandOperation::Hold { .. } => Self::Hold,
+            CommandOperation::Commit { .. } => Self::Commit,
+            CommandOperation::Release { .. } => Self::Release,
+            CommandOperation::Replace { .. } => Self::Replace,
+            CommandOperation::ProcessExpirations => Self::ProcessExpirations,
+        }
+    }
+}
+
+impl CanonicalHash for OperationTag {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&[*self as u8]);
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum RevisionModeTag {
+    Strict = 1,
+    Force = 2,
+}
+
+impl CanonicalHash for RevisionModeTag {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&[*self as u8]);
+    }
+}
+
+#[repr(u8)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplacementStateTag {
+    Held = 1,
+    Committed = 2,
+}
+
+impl CanonicalHash for ReplacementStateTag {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&[*self as u8]);
+    }
+}
+
+impl CanonicalHash for str {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        update_length(self.len(), hasher);
+        hasher.update(self.as_bytes());
+    }
+}
+
+impl CanonicalHash for u64 {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.to_be_bytes());
+    }
+}
+
+impl CanonicalHash for i64 {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.to_be_bytes());
+    }
+}
+
+impl CanonicalHash for ResourcePoolId {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.as_bytes());
+    }
+}
+
+impl CanonicalHash for PromiseId {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        hasher.update(&self.as_bytes());
+    }
+}
+
+impl CanonicalHash for Version {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        self.get().update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for Interval {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        self.start().update_hash(hasher);
+        self.end().update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for CapacityCurve {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        update_length(self.segments().len(), hasher);
+        for segment in self.segments() {
+            segment.interval().update_hash(hasher);
+            segment.capacity().update_hash(hasher);
+        }
+    }
+}
+
+impl CanonicalHash for Claim {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        self.pool_id().update_hash(hasher);
+        self.interval().update_hash(hasher);
+        self.quantity().update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for Bundle {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        let mut claims: Vec<&Claim> = self.claims().iter().collect();
+        claims.sort_unstable_by_key(|claim| {
+            let interval = claim.interval();
+            (
+                claim.pool_id().as_bytes(),
+                interval.start(),
+                interval.end(),
+                claim.quantity(),
+            )
+        });
+        update_length(claims.len(), hasher);
+        for claim in claims {
+            claim.update_hash(hasher);
+        }
+    }
+}
+
+impl CanonicalHash for CapacityRevisionMode {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        let tag = match self {
+            Self::Strict => RevisionModeTag::Strict,
+            Self::Force => RevisionModeTag::Force,
+        };
+        tag.update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for ReplacementState {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        match self {
+            Self::Held { expires_at } => {
+                ReplacementStateTag::Held.update_hash(hasher);
+                expires_at.update_hash(hasher);
+            }
+            Self::Committed => ReplacementStateTag::Committed.update_hash(hasher),
+        }
+    }
+}
 
 /// A deterministic BLAKE3 digest of one normalized command operation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -64,8 +237,62 @@ pub fn hash_operation(operation: &CommandOperation) -> CommandHash {
 /// - sort bundle claims by pool ID, interval start, interval end, and quantity;
 /// - never depend on Rust memory layout or `Hash` implementations.
 fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::Hasher) {
-    let _ = (operation, hasher);
-    todo!("write the canonical CommandOperation representation")
+    OperationTag::for_operation(operation).update_hash(hasher);
+
+    match operation {
+        CommandOperation::CreateResourcePool {
+            resource_pool_id,
+            display_name,
+            unit,
+            capacity_curve,
+        } => {
+            resource_pool_id.update_hash(hasher);
+            display_name.as_str().update_hash(hasher);
+            unit.as_str().update_hash(hasher);
+            capacity_curve.update_hash(hasher);
+        }
+        CommandOperation::ReviseCapacity {
+            resource_pool_id,
+            capacity_curve,
+            mode,
+        } => {
+            resource_pool_id.update_hash(hasher);
+            capacity_curve.update_hash(hasher);
+            mode.update_hash(hasher);
+        }
+        CommandOperation::Hold {
+            promise_id,
+            bundle,
+            expires_at,
+        } => {
+            promise_id.update_hash(hasher);
+            bundle.update_hash(hasher);
+            expires_at.update_hash(hasher);
+        }
+        CommandOperation::Commit {
+            promise_id,
+            expected_version,
+        }
+        | CommandOperation::Release {
+            promise_id,
+            expected_version,
+        } => {
+            promise_id.update_hash(hasher);
+            expected_version.update_hash(hasher);
+        }
+        CommandOperation::Replace {
+            promise_id,
+            expected_version,
+            new_bundle,
+            new_state,
+        } => {
+            promise_id.update_hash(hasher);
+            expected_version.update_hash(hasher);
+            new_bundle.update_hash(hasher);
+            new_state.update_hash(hasher);
+        }
+        CommandOperation::ProcessExpirations => {}
+    }
 }
 
 #[cfg(test)]
@@ -79,7 +306,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implement write_canonical_operation"]
     fn bundle_claim_order_does_not_change_the_hash() {
         let first_pool = ResourcePoolId::generate();
         let second_pool = ResourcePoolId::generate();
@@ -101,7 +327,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implement write_canonical_operation"]
     fn changing_a_payload_field_changes_the_hash() {
         let pool_id = ResourcePoolId::generate();
         let promise_id = crate::domain::PromiseId::generate();
@@ -120,7 +345,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "implement write_canonical_operation"]
     fn operation_variants_have_distinct_hashes() {
         let pool_id = ResourcePoolId::generate();
         let hold = CommandOperation::Hold {
