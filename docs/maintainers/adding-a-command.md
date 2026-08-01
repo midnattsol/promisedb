@@ -17,14 +17,14 @@ Edit `src/idempotency.rs`.
 - Assign a new permanent `OperationTag` value. Never renumber existing tags.
 - Implement every field in the `write_canonical_operation` match.
 - Use `CanonicalHash` implementations or add a private implementation for the new value type.
-- Use fixed-width big-endian integers.
+- Use fixed-width little-endian integers.
 - Prefix variable-length strings and collections with lengths.
 - Normalize collections only when their order is semantically irrelevant. Preserve ordered preference lists such as `Choice::alternatives`. Relative-bundle claims, like ordinary bundle claims, are unordered and require a stable sort key.
 - Include search controls and deadlines in operation identity; changing bounds, step, or expiration changes the command.
 - Add a hash test proving that meaningful field changes, including preference order, alter the hash.
 - Add or update a golden vector when changing the format intentionally.
 
-Changing canonical bytes is a compatibility change because recovered idempotency records depend on them.
+Changing canonical bytes is a version-sensitive compatibility change because recovered idempotency records depend on them; introduce a new format/domain version rather than changing the representation under an existing version.
 
 ## 3. Dispatch once
 

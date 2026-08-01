@@ -14,7 +14,7 @@ trait CanonicalHash {
 }
 
 fn update_length(length: usize, hasher: &mut blake3::Hasher) {
-    hasher.update(&(length as u64).to_be_bytes());
+    hasher.update(&(length as u64).to_le_bytes());
 }
 
 #[repr(u8)]
@@ -88,13 +88,13 @@ impl CanonicalHash for str {
 
 impl CanonicalHash for u64 {
     fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.to_be_bytes());
+        hasher.update(&self.to_le_bytes());
     }
 }
 
 impl CanonicalHash for i64 {
     fn update_hash(&self, hasher: &mut blake3::Hasher) {
-        hasher.update(&self.to_be_bytes());
+        hasher.update(&self.to_le_bytes());
     }
 }
 
@@ -282,7 +282,7 @@ pub fn hash_operation(operation: &CommandOperation) -> CommandHash {
 /// This is the learner-owned part of command idempotency. The representation must:
 ///
 /// - assign an explicit byte tag to every operation and enum variant;
-/// - encode integers with a fixed byte order;
+/// - encode fixed-width integers in little-endian byte order;
 /// - encode strings and collections with explicit lengths;
 /// - encode UUID-backed IDs as their 16 stable bytes;
 /// - sort bundle claims by pool ID, interval start, interval end, and quantity;
@@ -382,6 +382,34 @@ mod tests {
 
     fn claim(pool_id: ResourcePoolId, start: i64, end: i64, quantity: u64) -> Claim {
         Claim::new(pool_id, Interval::new(start, end).unwrap(), quantity).unwrap()
+    }
+
+    #[test]
+    fn canonical_fixed_width_integers_are_little_endian() {
+        let mut actual = blake3::Hasher::new();
+        update_length(0x0102, &mut actual);
+        0x0102_0304_0506_0708_u64.update_hash(&mut actual);
+        (-0x0102_0304_0506_0708_i64).update_hash(&mut actual);
+
+        let mut little_endian = blake3::Hasher::new();
+        little_endian.update(&0x0102_u64.to_le_bytes());
+        little_endian.update(&0x0102_0304_0506_0708_u64.to_le_bytes());
+        little_endian.update(&(-0x0102_0304_0506_0708_i64).to_le_bytes());
+
+        let mut big_endian = blake3::Hasher::new();
+        big_endian.update(&0x0102_u64.to_be_bytes());
+        big_endian.update(&0x0102_0304_0506_0708_u64.to_be_bytes());
+        big_endian.update(&(-0x0102_0304_0506_0708_i64).to_be_bytes());
+
+        assert_eq!(
+            actual.finalize().as_bytes(),
+            &[
+                204, 160, 63, 150, 34, 167, 166, 67, 31, 149, 187, 140, 56, 84, 201, 124, 115, 159,
+                246, 214, 15, 199, 9, 96, 191, 171, 187, 91, 1, 175, 56, 184,
+            ]
+        );
+        assert_eq!(actual.finalize(), little_endian.finalize());
+        assert_ne!(actual.finalize(), big_endian.finalize());
     }
 
     #[test]
