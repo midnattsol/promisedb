@@ -28,6 +28,8 @@ pub enum DomainError {
     ResourcePoolNotFound,
     /// A claim bundle would exceed a resource pool's available capacity.
     CapacityExceeded,
+    /// A strict capacity revision would make active usage exceed capacity.
+    CapacityRevisionCreatesDeficit,
     /// A referenced promise does not exist.
     PromiseNotFound,
     /// An operation is not allowed from the promise's current state.
@@ -62,6 +64,9 @@ impl Display for DomainError {
             }
             Self::ResourcePoolNotFound => "resource pool does not exist",
             Self::CapacityExceeded => "claim bundle exceeds available resource pool capacity",
+            Self::CapacityRevisionCreatesDeficit => {
+                "strict capacity revision would create a deficit"
+            }
             Self::PromiseNotFound => "promise does not exist",
             Self::InvalidPromiseState => "operation is not allowed from the current promise state",
             Self::VersionConflict => "expected promise version does not match the current version",

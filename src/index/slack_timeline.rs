@@ -18,6 +18,30 @@ use std::ops::Range;
 /// and negative values represent a deficit created by forced capacity changes.
 pub type Slack = i128;
 
+/// A half-open interval where effective slack is negative.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlackDeficit {
+    interval: Interval,
+    amount: Slack,
+}
+
+impl SlackDeficit {
+    /// Creates a normalized deficit interval.
+    pub fn new(interval: Interval, amount: Slack) -> Self {
+        Self { interval, amount }
+    }
+
+    /// Returns the interval over which the deficit applies.
+    pub fn interval(self) -> Interval {
+        self.interval
+    }
+
+    /// Returns the positive magnitude of the deficit.
+    pub fn amount(self) -> Slack {
+        self.amount
+    }
+}
+
 const MAX_POINTS_PER_BLOCK: usize = 256;
 
 #[derive(Debug, Default, Clone, Copy)]
@@ -486,6 +510,35 @@ impl SlackTimeline {
         self.extreme_slack(interval, true)
     }
 
+    /// Returns normalized intervals whose effective slack is negative.
+    ///
+    /// Each effective point defines the value from its timestamp until the next
+    /// point. Adjacent intervals with the same deficit magnitude are merged.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`IndexError::SlackOverflow`] when an effective slack value or its
+    /// positive deficit magnitude cannot be represented.
+    pub fn deficit_intervals(&self) -> Result<Vec<SlackDeficit>, IndexError> {
+        let points = self.effective_points()?;
+        let mut deficit_per_interval: Vec<SlackDeficit> = Vec::new();
+        for window in points.windows(2) {
+            let current = window[0];
+            let next = window[1];
+
+            if current.slack() < 0 {
+                let interval = Interval::new(current.timestamp(), next.timestamp())
+                    .map_err(|_| IndexError::InvalidPointRange)?;
+                let amount = current
+                    .slack()
+                    .checked_neg()
+                    .ok_or(IndexError::SlackOverflow)?;
+                deficit_per_interval.push(SlackDeficit::new(interval, amount));
+            }
+        }
+        Ok(deficit_per_interval)
+    }
+
     /// Applies `delta` throughout the half-open `interval`.
     ///
     /// Complete interior blocks receive a lazy block delta. Only boundary blocks
@@ -809,6 +862,43 @@ mod tests {
             assert_eq!(block.minimum_slack(), effective.iter().copied().min());
             assert_eq!(block.maximum_slack(), effective.iter().copied().max());
         }
+    }
+
+    #[test]
+    fn extracts_normalized_deficit_intervals() {
+        let timeline = SlackTimeline {
+            blocks: vec![
+                SlackBlock::from_sorted_points(vec![
+                    point(0, 4),
+                    point(10, -2),
+                    point(30, -3),
+                    point(40, 1),
+                ])
+                .expect("the block should be valid"),
+            ],
+        };
+
+        assert_eq!(
+            timeline
+                .deficit_intervals()
+                .expect("deficits should be extracted"),
+            vec![
+                SlackDeficit::new(Interval::new(10, 30).unwrap(), 2),
+                SlackDeficit::new(Interval::new(30, 40).unwrap(), 3),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_non_negative_timeline_has_no_deficits() {
+        let timeline = SlackTimeline {
+            blocks: vec![
+                SlackBlock::from_sorted_points(vec![point(0, 4), point(10, 0)])
+                    .expect("the block should be valid"),
+            ],
+        };
+
+        assert_eq!(timeline.deficit_intervals(), Ok(Vec::new()));
     }
 
     #[test]

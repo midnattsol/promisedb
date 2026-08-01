@@ -5,8 +5,12 @@
 //! a second authoritative usage counter.
 
 mod availability;
+mod capacity_revision;
 
 pub use availability::{AvailabilityConflict, HoldOutcome, ReplaceOutcome};
+pub use capacity_revision::{
+    AtRiskPromise, CapacityDeficit, CapacityRevisionMode, CapacityRevisionOutcome,
+};
 
 use crate::clock::{Clock, SystemClock};
 use crate::domain::DomainError;
@@ -193,6 +197,172 @@ impl Engine {
         let now = self.clock.now()?;
         let pool_id = ResourcePoolId::generate();
         self.create_resource_pool_at(pool_id, display_name, unit, capacity_curve, now)
+    }
+
+    /// Replaces one pool's capacity curve using an authoritative timestamp.
+    ///
+    /// The candidate timeline is rebuilt from the replacement curve and all active
+    /// promises before any state is published. Strict mode rejects a resulting
+    /// deficit; force mode accepts it and reports affected promises.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when expiration processing fails, the pool does not exist,
+    /// index reconstruction overflows, strict mode would create a deficit, or the
+    /// global sequence is exhausted.
+    pub(crate) fn revise_capacity_at(
+        &mut self,
+        pool_id: ResourcePoolId,
+        capacity_curve: CapacityCurve,
+        mode: CapacityRevisionMode,
+        now: Timestamp,
+    ) -> Result<CapacityRevisionOutcome, DomainError> {
+        self.process_expirations(now)?;
+
+        let current_pool = self
+            .resource_pools
+            .get(&pool_id)
+            .ok_or(DomainError::ResourcePoolNotFound)?;
+        let active_promises: Vec<&Promise> = self.promises.values().collect();
+        let revised_timeline =
+            SlackTimeline::from_capacity_and_promises(&capacity_curve, pool_id, &active_promises)
+                .map_err(|_| DomainError::IndexOverflow)?;
+        let deficits = self.capacity_deficits(pool_id, &revised_timeline)?;
+
+        if mode == CapacityRevisionMode::Strict && !deficits.is_empty() {
+            return Err(DomainError::CapacityRevisionCreatesDeficit);
+        }
+
+        let next_sequence = self.next_sequence()?;
+        let mut revised_pool = current_pool.clone();
+        revised_pool.replace_capacity_curve(capacity_curve);
+        let mut affected_promise_ids: Vec<PromiseId> = deficits
+            .iter()
+            .flat_map(|deficit| deficit.affected_promise_ids.iter().copied())
+            .collect();
+        affected_promise_ids.sort_unstable();
+        affected_promise_ids.dedup();
+
+        self.resource_pools.insert(pool_id, revised_pool);
+        self.slack_timelines.insert(pool_id, revised_timeline);
+        self.sequence = next_sequence;
+
+        Ok(CapacityRevisionOutcome {
+            sequence: next_sequence,
+            deficits,
+            affected_promise_ids,
+        })
+    }
+
+    /// Replaces one pool's capacity curve using one timestamp from the clock.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock or deterministic revision transition fails.
+    pub fn revise_capacity(
+        &mut self,
+        pool_id: ResourcePoolId,
+        capacity_curve: CapacityCurve,
+        mode: CapacityRevisionMode,
+    ) -> Result<CapacityRevisionOutcome, DomainError> {
+        let now = self.clock.now()?;
+        self.revise_capacity_at(pool_id, capacity_curve, mode, now)
+    }
+
+    /// Lists active promises overlapping current deficit intervals at `now`.
+    ///
+    /// Optional pool and time filters restrict which deficits are considered. Due
+    /// expirations are processed before the derived result is calculated.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a missing requested pool, expiration failure, or index
+    /// arithmetic overflow.
+    pub(crate) fn list_at_risk_at(
+        &mut self,
+        resource_pool_id: Option<ResourcePoolId>,
+        time_range: Option<Interval>,
+        now: Timestamp,
+    ) -> Result<Vec<AtRiskPromise>, DomainError> {
+        self.process_expirations(now)?;
+
+        if resource_pool_id.is_some_and(|pool_id| !self.resource_pools.contains_key(&pool_id)) {
+            return Err(DomainError::ResourcePoolNotFound);
+        }
+
+        let mut promises_by_id: BTreeMap<PromiseId, Vec<CapacityDeficit>> = BTreeMap::new();
+        for (pool_id, timeline) in &self.slack_timelines {
+            if resource_pool_id.is_some_and(|requested| requested != *pool_id) {
+                continue;
+            }
+
+            for deficit in self.capacity_deficits(*pool_id, timeline)? {
+                if time_range.is_some_and(|range| !range.overlaps(&deficit.interval)) {
+                    continue;
+                }
+                for promise_id in &deficit.affected_promise_ids {
+                    promises_by_id
+                        .entry(*promise_id)
+                        .or_default()
+                        .push(deficit.clone());
+                }
+            }
+        }
+
+        Ok(promises_by_id
+            .into_iter()
+            .map(|(promise_id, deficits)| AtRiskPromise {
+                promise_id,
+                deficits,
+            })
+            .collect())
+    }
+
+    /// Lists active promises overlapping current deficit intervals.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock or deterministic query transition fails.
+    pub fn list_at_risk(
+        &mut self,
+        resource_pool_id: Option<ResourcePoolId>,
+        time_range: Option<Interval>,
+    ) -> Result<Vec<AtRiskPromise>, DomainError> {
+        let now = self.clock.now()?;
+        self.list_at_risk_at(resource_pool_id, time_range, now)
+    }
+
+    /// Explains every interval that prevents a bundle from being admitted at `now`.
+    ///
+    /// This query never consumes candidate capacity. Due expirations are processed
+    /// first so the explanation observes the same state as a subsequent command.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when expiration or admission evaluation fails.
+    pub(crate) fn explain_unavailable_at(
+        &mut self,
+        bundle: &Bundle,
+        now: Timestamp,
+    ) -> Result<Vec<AvailabilityConflict>, DomainError> {
+        self.process_expirations(now)?;
+        match self.evaluate_bundle_admission(bundle)? {
+            BundleAdmission::Available(_) => Ok(Vec::new()),
+            BundleAdmission::Unavailable(conflicts) => Ok(conflicts),
+        }
+    }
+
+    /// Explains every interval that currently prevents a bundle from admission.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock or deterministic query transition fails.
+    pub fn explain_unavailable(
+        &mut self,
+        bundle: &Bundle,
+    ) -> Result<Vec<AvailabilityConflict>, DomainError> {
+        let now = self.clock.now()?;
+        self.explain_unavailable_at(bundle, now)
     }
 
     /// Atomically holds a bundle using an authoritative timestamp.
@@ -575,7 +745,7 @@ impl Engine {
         let timeline = self
             .slack_timeline(pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?;
-        self.evaluate_pool_on_timeline(pool_id, candidate_claims, timeline)
+        self.evaluate_pool_on_timeline(pool_id, candidate_claims, timeline, None)
     }
 
     /// Evaluates one pool against a caller-provided base timeline.
@@ -587,6 +757,7 @@ impl Engine {
         pool_id: ResourcePoolId,
         candidate_claims: &[&Claim],
         base_timeline: &SlackTimeline,
+        deficit_floor: Option<&SlackTimeline>,
     ) -> Result<PoolAdmission, DomainError> {
         let mut slack_timeline = base_timeline.clone();
         let mut demand_events: Vec<(Timestamp, i128)> = Vec::new();
@@ -643,13 +814,23 @@ impl Engine {
             let slack = slack_timeline
                 .slack_at(interval.start())
                 .map_err(|_| DomainError::IndexOverflow)?;
+            let final_slack = slack
+                .checked_sub(current_demand)
+                .ok_or(DomainError::IndexOverflow)?;
+            let minimum_allowed_slack = match deficit_floor {
+                Some(timeline) => timeline
+                    .slack_at(interval.start())
+                    .map_err(|_| DomainError::IndexOverflow)?
+                    .min(0),
+                None => 0,
+            };
             let available_quantity = if slack <= 0 {
                 0
             } else {
                 Quantity::try_from(slack).map_err(|_| DomainError::IndexOverflow)?
             };
 
-            if required_quantity > available_quantity {
+            if final_slack < minimum_allowed_slack {
                 let conflicting_promise_ids = self
                     .promises
                     .iter()
@@ -725,7 +906,10 @@ impl Engine {
         let mut conflicts = Vec::new();
         for (pool_id, claims) in claims_by_pool {
             let pool_admission = if let Some(timeline) = overrides.get(&pool_id) {
-                self.evaluate_pool_on_timeline(pool_id, &claims, timeline)?
+                let current_timeline = self
+                    .slack_timeline(pool_id)
+                    .ok_or(DomainError::ResourcePoolNotFound)?;
+                self.evaluate_pool_on_timeline(pool_id, &claims, timeline, Some(current_timeline))?
             } else {
                 self.evaluate_pool_admission(pool_id, &claims)?
             };
@@ -751,6 +935,45 @@ impl Engine {
             });
             Ok(BundleAdmission::Unavailable(conflicts))
         }
+    }
+
+    /// Converts index-level negative slack into public capacity deficits.
+    fn capacity_deficits(
+        &self,
+        pool_id: ResourcePoolId,
+        timeline: &SlackTimeline,
+    ) -> Result<Vec<CapacityDeficit>, DomainError> {
+        timeline
+            .deficit_intervals()
+            .map_err(|_| DomainError::IndexOverflow)?
+            .into_iter()
+            .map(|deficit| {
+                let interval = deficit.interval();
+                let quantity =
+                    Quantity::try_from(deficit.amount()).map_err(|_| DomainError::IndexOverflow)?;
+                let affected_promise_ids = self
+                    .promises
+                    .iter()
+                    .filter_map(|(promise_id, promise)| {
+                        let active = matches!(
+                            promise.state(),
+                            PromiseState::Held { .. } | PromiseState::Committed
+                        );
+                        let overlaps = promise.bundle().claims().iter().any(|claim| {
+                            claim.pool_id() == pool_id && claim.interval().overlaps(&interval)
+                        });
+                        (active && overlaps).then_some(*promise_id)
+                    })
+                    .collect();
+
+                Ok(CapacityDeficit {
+                    resource_pool_id: pool_id,
+                    interval,
+                    quantity,
+                    affected_promise_ids,
+                })
+            })
+            .collect()
     }
 
     /// Prepares timeline copies after active bundle usage is removed.
@@ -1206,6 +1429,245 @@ mod tests {
                 .state(),
             PromiseState::Released
         );
+    }
+
+    #[test]
+    fn strict_capacity_revision_rejects_a_deficit_without_mutation() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        let original_pool = engine.resource_pool(pool_id).unwrap().clone();
+        let original_timeline = engine.slack_timeline(pool_id).unwrap().clone();
+
+        let result = engine.revise_capacity_at(
+            pool_id,
+            constant_capacity_curve(5),
+            CapacityRevisionMode::Strict,
+            NOW,
+        );
+
+        assert_eq!(result, Err(DomainError::CapacityRevisionCreatesDeficit));
+        assert_eq!(engine.resource_pool(pool_id), Some(&original_pool));
+        assert_eq!(engine.slack_timeline(pool_id), Some(&original_timeline));
+        assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn forced_capacity_revision_reports_deficits_and_affected_promises() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+
+        let outcome = engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+
+        assert_eq!(outcome.sequence().get(), 2);
+        assert_eq!(outcome.affected_promise_ids(), &[promise_id]);
+        assert_eq!(outcome.deficits().len(), 1);
+        assert_eq!(outcome.deficits()[0].resource_pool_id(), pool_id);
+        assert_eq!(
+            outcome.deficits()[0].interval(),
+            Interval::new(0, 10).unwrap()
+        );
+        assert_eq!(outcome.deficits()[0].quantity(), 3);
+        assert_eq!(outcome.deficits()[0].affected_promise_ids(), &[promise_id]);
+        assert_eq!(engine.resource_pool(pool_id).unwrap().capacity_at(5), 5);
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(-3));
+    }
+
+    #[test]
+    fn strict_capacity_increase_applies_without_deficits() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+
+        let outcome = engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(12),
+                CapacityRevisionMode::Strict,
+                NOW,
+            )
+            .expect("the capacity increase should be applied");
+
+        assert!(outcome.deficits().is_empty());
+        assert!(outcome.affected_promise_ids().is_empty());
+        assert_eq!(outcome.sequence().get(), 2);
+        assert_eq!(engine.resource_pool(pool_id).unwrap().capacity_at(5), 12);
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(4));
+    }
+
+    #[test]
+    fn later_capacity_revision_resolves_a_forced_deficit() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+
+        let outcome = engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(8),
+                CapacityRevisionMode::Strict,
+                NOW,
+            )
+            .expect("the deficit should be resolved");
+
+        assert!(outcome.deficits().is_empty());
+        assert!(
+            engine
+                .list_at_risk_at(None, None, NOW)
+                .expect("at-risk promises should be listed")
+                .is_empty()
+        );
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(0));
+        assert_eq!(engine.sequence().get(), 3);
+    }
+
+    #[test]
+    fn capacity_revision_processes_due_expirations_first() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 8), 100, 1);
+
+        let outcome = engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(0),
+                CapacityRevisionMode::Strict,
+                100,
+            )
+            .expect("expired usage should not create a deficit");
+
+        assert!(outcome.deficits().is_empty());
+        assert_eq!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Expired
+        );
+        assert_eq!(engine.sequence().get(), 3);
+    }
+
+    #[test]
+    fn list_at_risk_supports_pool_and_time_filters() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+
+        let matching = engine
+            .list_at_risk_at(Some(pool_id), Some(Interval::new(5, 15).unwrap()), NOW)
+            .expect("the at-risk promises should be listed");
+        let outside = engine
+            .list_at_risk_at(Some(pool_id), Some(Interval::new(10, 20).unwrap()), NOW)
+            .expect("the filtered result should be listed");
+
+        assert_eq!(matching.len(), 1);
+        assert_eq!(matching[0].promise_id(), promise_id);
+        assert_eq!(matching[0].deficits().len(), 1);
+        assert!(outside.is_empty());
+    }
+
+    #[test]
+    fn forced_deficit_blocks_new_holds_and_is_explainable() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+        let candidate = bundle(vec![claim(pool_id, 0, 10, 1)]);
+
+        let conflicts = engine
+            .explain_unavailable_at(&candidate, NOW)
+            .expect("the unavailable bundle should be explained");
+        let outcome = engine
+            .hold_at(candidate, EXPIRES_AT, NOW)
+            .expect("unavailability should be a normal outcome");
+
+        assert_eq!(conflicts.len(), 1);
+        assert_eq!(
+            conflicts[0].blocking_interval(),
+            Interval::new(0, 10).unwrap()
+        );
+        assert!(matches!(outcome, HoldOutcome::Unavailable { .. }));
+        assert_eq!(engine.sequence().get(), 2);
+    }
+
+    #[test]
+    fn replacement_may_reduce_a_forced_deficit_without_resolving_it() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+        let expected_version = engine.promise(promise_id).unwrap().version();
+
+        let outcome = engine
+            .replace_at(
+                promise_id,
+                expected_version,
+                bundle(vec![claim(pool_id, 0, 10, 6)]),
+                ReplacementState::Committed,
+                NOW,
+            )
+            .expect("a deficit-improving replacement should be evaluated");
+
+        assert!(matches!(outcome, ReplaceOutcome::Replaced { .. }));
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(-1));
+    }
+
+    #[test]
+    fn replacement_cannot_worsen_a_forced_deficit() {
+        let (mut engine, pool_id) = engine_with_pool(10);
+        let promise_id = add_held_promise(&mut engine, claim(pool_id, 0, 10, 8), 1);
+        engine
+            .revise_capacity_at(
+                pool_id,
+                constant_capacity_curve(5),
+                CapacityRevisionMode::Force,
+                NOW,
+            )
+            .expect("the forced revision should be applied");
+        let original_promise = engine.promise(promise_id).unwrap().clone();
+        let expected_version = original_promise.version();
+
+        let outcome = engine
+            .replace_at(
+                promise_id,
+                expected_version,
+                bundle(vec![claim(pool_id, 0, 10, 9)]),
+                ReplacementState::Committed,
+                NOW,
+            )
+            .expect("unavailability should be a normal outcome");
+
+        assert!(matches!(outcome, ReplaceOutcome::Unavailable { .. }));
+        assert_eq!(engine.promise(promise_id), Some(&original_promise));
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(5), Ok(-3));
+        assert_eq!(engine.sequence().get(), 2);
     }
 
     #[test]

@@ -76,6 +76,11 @@ impl ResourcePool {
         &self.capacity_curve
     }
 
+    /// Replaces the physical capacity curve while preserving pool identity and unit.
+    pub(crate) fn replace_capacity_curve(&mut self, capacity_curve: CapacityCurve) {
+        self.capacity_curve = capacity_curve;
+    }
+
     /// Returns the pool's capacity at `timestamp`.
     pub fn capacity_at(&self, timestamp: Timestamp) -> Quantity {
         self.capacity_curve.capacity_at(timestamp)

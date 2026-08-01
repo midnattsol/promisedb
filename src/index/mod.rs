@@ -7,4 +7,4 @@ mod error;
 mod slack_timeline;
 
 pub use error::IndexError;
-pub use slack_timeline::{Slack, SlackBlock, SlackPoint, SlackTimeline};
+pub use slack_timeline::{Slack, SlackBlock, SlackDeficit, SlackPoint, SlackTimeline};

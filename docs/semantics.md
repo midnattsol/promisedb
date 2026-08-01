@@ -30,6 +30,16 @@ A resource pool owns a piecewise-constant `CapacityCurve`. Segments are ordered,
 
 Capacity outside declared segments, including gaps, is zero.
 
+## Capacity revisions and deficits
+
+A capacity revision replaces one resource pool's complete capacity curve. Due hold expirations are processed first, and the candidate slack timeline is rebuilt from the replacement curve plus every active claim before publication.
+
+`Strict` mode rejects the revision with `CapacityRevisionCreatesDeficit` if any resulting slack is negative. The pool, timeline, and requested revision sequence remain unchanged.
+
+`Force` mode accepts the new physical reality even when active usage exceeds capacity. Negative slack is exposed as normalized `CapacityDeficit` intervals with positive deficit quantities and the IDs of overlapping active promises. `list_at_risk` reports those promises without selecting cancellations or victims.
+
+A new hold cannot consume capacity in an existing deficit. An atomic replacement may leave a deficit only when its final slack is no worse than the slack before replacement; this permits moves that reduce an existing deficit without requiring an observable release-first transition.
+
 ## Claims and bundles
 
 A claim consumes a positive quantity from one resource pool during one interval. A bundle is a non-empty collection of claims accepted or rejected atomically.
