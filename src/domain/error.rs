@@ -12,6 +12,10 @@ pub enum DomainError {
     UnsortedCapacitySegments,
     /// Two capacity segments overlap in time.
     OverlappingCapacitySegments,
+    /// A resource unit has an empty or whitespace-only name.
+    InvalidUnitName,
+    /// A resource unit declares zero subunits per displayed unit.
+    InvalidUnitScale,
     /// A claim has a zero quantity.
     InvalidQuantity,
     /// Capacity or usage arithmetic overflowed.
@@ -58,6 +62,8 @@ impl Display for DomainError {
             Self::InvalidInterval => "interval start must be less than its end",
             Self::UnsortedCapacitySegments => "capacity segments must be chronologically ordered",
             Self::OverlappingCapacitySegments => "capacity segments must not overlap",
+            Self::InvalidUnitName => "unit name must not be empty",
+            Self::InvalidUnitScale => "subunits per unit must be greater than zero",
             Self::InvalidQuantity => "quantity must be greater than zero",
             Self::QuantityOverflow => "capacity or usage arithmetic overflowed",
             Self::IndexOverflow => "derived index arithmetic overflowed",

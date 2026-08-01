@@ -8,7 +8,7 @@ A successful hold reserves all claims in the bundle as one promise. That promise
 
 ## Core model
 
-- A **resource pool** provides a finite quantity measured in an application-defined unit.
+- A **resource pool** provides finite integer subunits under an application-defined fixed-point unit.
 - A **claim** requests a quantity from one pool during a half-open interval `[start, end)`.
 - A **bundle** is a non-empty set of claims accepted or rejected atomically.
 - A **promise** owns an accepted bundle and moves through a versioned lifecycle.

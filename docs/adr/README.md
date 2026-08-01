@@ -31,3 +31,4 @@ ADRs explain why a decision exists. Current behavior belongs in `docs/semantics.
 - [ADR-0006: GNU AGPL v3 licensing](0000-agpl-v3-license.md)
 - [ADR-0007: Control-plane preparation and deterministic commands](0007-control-plane-command-boundary.md)
 - [ADR-0008: Canonical command hashing for idempotency](0008-canonical-command-idempotency.md)
+- [ADR-0009: Explicit fixed-point resource units](0009-explicit-fixed-point-units.md)

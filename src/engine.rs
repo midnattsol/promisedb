@@ -17,7 +17,7 @@ use crate::command::{ClientId, Command, CommandOperation, CommandResult, Idempot
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
-    ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
+    ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Unit, Version,
 };
 use crate::event::{Event, EventData, EventKind};
 use crate::idempotency::{IdempotencyRecord, hash_operation};
@@ -299,7 +299,7 @@ impl Engine {
         &mut self,
         pool_id: ResourcePoolId,
         display_name: String,
-        unit: String,
+        unit: Unit,
         capacity_curve: CapacityCurve,
         now: Timestamp,
     ) -> Result<ResourcePoolId, DomainError> {
@@ -338,7 +338,7 @@ impl Engine {
     pub fn create_resource_pool(
         &mut self,
         display_name: String,
-        unit: String,
+        unit: Unit,
         capacity_curve: CapacityCurve,
     ) -> Result<ResourcePoolId, DomainError> {
         let now = self.clock.now()?;
@@ -1261,6 +1261,10 @@ mod tests {
         }
     }
 
+    fn unit(name: &str, subunits_per_unit: u64) -> Unit {
+        Unit::new(name.into(), subunits_per_unit).expect("the unit should be valid")
+    }
+
     fn constant_capacity_curve(capacity: Quantity) -> CapacityCurve {
         let interval = Interval::new(Timestamp::MIN, Timestamp::MAX)
             .expect("the constant-capacity interval should be valid");
@@ -1272,7 +1276,7 @@ mod tests {
         let mut engine = Engine::new();
         let pool = ResourcePool::new(
             "Test pool".into(),
-            "units".into(),
+            unit("units", 1),
             constant_capacity_curve(capacity),
         );
         let pool_id = pool.id();
@@ -1306,7 +1310,7 @@ mod tests {
             .create_resource_pool_at(
                 pool_id,
                 "Variable pool".into(),
-                "units".into(),
+                unit("units", 1),
                 capacity_curve,
                 NOW,
             )
@@ -1404,7 +1408,7 @@ mod tests {
                 command(CommandOperation::CreateResourcePool {
                     resource_pool_id: pool_id,
                     display_name: "Command pool".into(),
-                    unit: "units".into(),
+                    unit: unit("units", 1),
                     capacity_curve: constant_capacity_curve(10),
                 }),
                 NOW,
@@ -1770,7 +1774,7 @@ mod tests {
                 command(CommandOperation::CreateResourcePool {
                     resource_pool_id: first_pool_id,
                     display_name: "First".into(),
-                    unit: "units".into(),
+                    unit: unit("units", 1),
                     capacity_curve: constant_capacity_curve(10),
                 }),
                 NOW,
@@ -1792,7 +1796,7 @@ mod tests {
                 command(CommandOperation::CreateResourcePool {
                     resource_pool_id: ResourcePoolId::generate(),
                     display_name: "Second".into(),
-                    unit: "units".into(),
+                    unit: unit("units", 1),
                     capacity_curve: constant_capacity_curve(1),
                 }),
                 100,
@@ -1902,7 +1906,7 @@ mod tests {
             .create_resource_pool_at(
                 pool_id,
                 "Machine pool".into(),
-                "machines".into(),
+                unit("machines", 100),
                 constant_capacity_curve(10),
                 NOW,
             )
@@ -1913,7 +1917,8 @@ mod tests {
             .expect("the resource pool should exist");
         assert_eq!(created_id, pool_id);
         assert_eq!(pool.display_name(), "Machine pool");
-        assert_eq!(pool.unit(), "machines");
+        assert_eq!(pool.unit().name(), "machines");
+        assert_eq!(pool.unit().subunits_per_unit(), 100);
         assert_eq!(pool.capacity_at(NOW), 10);
 
         let timeline = engine
@@ -1997,7 +2002,7 @@ mod tests {
             .create_resource_pool_at(
                 pool_id,
                 "Unavailable pool".into(),
-                "machines".into(),
+                unit("machines", 1),
                 CapacityCurve::empty(),
                 NOW,
             )
@@ -2029,7 +2034,7 @@ mod tests {
             .create_resource_pool_at(
                 pool_id,
                 "Original".into(),
-                "machines".into(),
+                unit("machines", 100),
                 constant_capacity_curve(10),
                 NOW,
             )
@@ -2038,7 +2043,7 @@ mod tests {
         let result = engine.create_resource_pool_at(
             pool_id,
             "Replacement".into(),
-            "people".into(),
+            unit("people", 1),
             constant_capacity_curve(20),
             NOW,
         );
@@ -2048,7 +2053,8 @@ mod tests {
             .resource_pool(pool_id)
             .expect("the original resource pool should remain");
         assert_eq!(pool.display_name(), "Original");
-        assert_eq!(pool.unit(), "machines");
+        assert_eq!(pool.unit().name(), "machines");
+        assert_eq!(pool.unit().subunits_per_unit(), 100);
         assert_eq!(pool.capacity_at(NOW), 10);
         assert_eq!(
             engine

@@ -16,7 +16,7 @@ src/
 
 ### Domain
 
-The domain owns structural invariants for intervals, claims, bundles, promises, resource pools, and capacity curves. Domain objects do not read clocks or global state.
+The domain owns structural invariants for intervals, fixed-point units, claims, bundles, promises, resource pools, and capacity curves. Domain objects do not read clocks or global state. Each pool fixes a unit name and integer subunit scale; decimal conversion remains outside the engine.
 
 ### Command boundary
 

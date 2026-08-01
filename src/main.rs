@@ -1,6 +1,7 @@
 use promisedb::clock::{Clock, SystemClock};
 use promisedb::domain::{
     Bundle, CapacityCurve, CapacitySegment, Claim, DomainError, Interval, PromiseId, Timestamp,
+    Unit,
 };
 use promisedb::engine::{Engine, HoldOutcome};
 use std::error::Error;
@@ -40,7 +41,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         CapacityCurve::from_sorted(vec![CapacitySegment::new(capacity_interval, 2)])?;
     let pool_id = engine.create_resource_pool(
         "Assembly machines".into(),
-        "machines".into(),
+        Unit::new("machines".into(), 1)?,
         capacity_curve,
     )?;
     println!(

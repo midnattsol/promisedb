@@ -2,7 +2,8 @@
 
 use crate::command::{CommandOperation, CommandResult};
 use crate::domain::{
-    Bundle, CapacityCurve, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId, Version,
+    Bundle, CapacityCurve, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId, Unit,
+    Version,
 };
 use crate::engine::CapacityRevisionMode;
 
@@ -115,6 +116,13 @@ impl CanonicalHash for Interval {
     fn update_hash(&self, hasher: &mut blake3::Hasher) {
         self.start().update_hash(hasher);
         self.end().update_hash(hasher);
+    }
+}
+
+impl CanonicalHash for Unit {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        self.name().update_hash(hasher);
+        self.subunits_per_unit().update_hash(hasher);
     }
 }
 
@@ -251,7 +259,7 @@ fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::
         } => {
             resource_pool_id.update_hash(hasher);
             display_name.as_str().update_hash(hasher);
-            unit.as_str().update_hash(hasher);
+            unit.update_hash(hasher);
             capacity_curve.update_hash(hasher);
         }
         CommandOperation::ReviseCapacity {
@@ -302,7 +310,7 @@ fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::
 mod tests {
     use super::*;
     use crate::command::CommandOperation;
-    use crate::domain::{Bundle, Claim, Interval, ResourcePoolId};
+    use crate::domain::{Bundle, Claim, Interval, ResourcePoolId, Unit};
 
     fn claim(pool_id: ResourcePoolId, start: i64, end: i64, quantity: u64) -> Claim {
         Claim::new(pool_id, Interval::new(start, end).unwrap(), quantity).unwrap()
@@ -345,6 +353,22 @@ mod tests {
         };
 
         assert_ne!(hash_operation(&first), hash_operation(&changed));
+    }
+
+    #[test]
+    fn unit_scale_changes_the_create_resource_hash() {
+        let pool_id = ResourcePoolId::generate();
+        let operation = |subunits_per_unit| CommandOperation::CreateResourcePool {
+            resource_pool_id: pool_id,
+            display_name: "Power".into(),
+            unit: Unit::new("watts".into(), subunits_per_unit).unwrap(),
+            capacity_curve: CapacityCurve::empty(),
+        };
+
+        assert_ne!(
+            hash_operation(&operation(1)),
+            hash_operation(&operation(1_000))
+        );
     }
 
     #[test]

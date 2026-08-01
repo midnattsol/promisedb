@@ -2,7 +2,7 @@
 
 use uuid::Uuid;
 
-use super::{CapacityCurve, Quantity, Timestamp};
+use super::{CapacityCurve, Quantity, Timestamp, Unit};
 
 /// The opaque identifier of a [`ResourcePool`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -20,21 +20,21 @@ impl ResourcePoolId {
     }
 }
 
-/// A named pool with finite capacity measured in one opaque unit.
+/// A named pool with finite capacity measured in one immutable fixed-point unit.
 ///
-/// PromiseDB does not interpret or convert the unit. Examples include
-/// `"machines"`, `"people"`, and `"watts"`.
+/// PromiseDB stores quantities as integer subunits and does not perform display-unit
+/// conversion inside the engine.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ResourcePool {
     id: ResourcePoolId,
     display_name: String,
-    unit: String,
+    unit: Unit,
     capacity_curve: CapacityCurve,
 }
 
 impl ResourcePool {
     /// Creates a resource pool with a generated identifier.
-    pub fn new(display_name: String, unit: String, capacity_curve: CapacityCurve) -> Self {
+    pub fn new(display_name: String, unit: Unit, capacity_curve: CapacityCurve) -> Self {
         Self::with_id(
             ResourcePoolId::generate(),
             display_name,
@@ -50,7 +50,7 @@ impl ResourcePool {
     pub(crate) fn with_id(
         id: ResourcePoolId,
         display_name: String,
-        unit: String,
+        unit: Unit,
         capacity_curve: CapacityCurve,
     ) -> Self {
         Self {
@@ -71,9 +71,9 @@ impl ResourcePool {
         self.display_name.as_str()
     }
 
-    /// Returns the opaque unit used by capacities and claims.
-    pub fn unit(&self) -> &str {
-        self.unit.as_str()
+    /// Returns the immutable fixed-point unit used by capacities and claims.
+    pub fn unit(&self) -> &Unit {
+        &self.unit
     }
 
     /// Returns the pool's capacity curve.
@@ -97,6 +97,10 @@ mod tests {
     use super::*;
     use crate::domain::{CapacitySegment, Interval};
 
+    fn unit(name: &str, subunits_per_unit: u64) -> Unit {
+        Unit::new(name.into(), subunits_per_unit).expect("the unit should be valid")
+    }
+
     fn constant_capacity_curve(capacity: Quantity) -> CapacityCurve {
         let interval = Interval::new(Timestamp::MIN, Timestamp::MAX)
             .expect("the constant-capacity interval should be valid");
@@ -108,13 +112,14 @@ mod tests {
     fn creates_a_resource_pool() {
         let pool = ResourcePool::new(
             "Main machine pool".into(),
-            "machines".into(),
+            unit("machines", 100),
             constant_capacity_curve(10),
         );
 
         assert!(!pool.id().0.is_nil());
         assert_eq!(pool.display_name(), "Main machine pool");
-        assert_eq!(pool.unit(), "machines");
+        assert_eq!(pool.unit().name(), "machines");
+        assert_eq!(pool.unit().subunits_per_unit(), 100);
         assert_eq!(pool.capacity_at(0), 10);
     }
 
@@ -131,7 +136,7 @@ mod tests {
             ),
         ])
         .expect("the capacity curve should be valid");
-        let pool = ResourcePool::new("Variable machine pool".into(), "machines".into(), curve);
+        let pool = ResourcePool::new("Variable machine pool".into(), unit("machines", 1), curve);
 
         assert_eq!(pool.capacity_at(-1), 0);
         assert_eq!(pool.capacity_at(50), 10);
@@ -144,7 +149,7 @@ mod tests {
     fn accepts_an_empty_capacity_curve() {
         let pool = ResourcePool::new(
             "Unavailable pool".into(),
-            "machines".into(),
+            unit("machines", 1),
             CapacityCurve::empty(),
         );
 

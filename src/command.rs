@@ -4,7 +4,7 @@
 //! The engine applies those commands without randomness or clock access.
 
 use crate::domain::{
-    Bundle, CapacityCurve, PromiseId, ReplacementState, ResourcePoolId, Timestamp, Version,
+    Bundle, CapacityCurve, PromiseId, ReplacementState, ResourcePoolId, Timestamp, Unit, Version,
 };
 use crate::engine::{CapacityRevisionMode, CapacityRevisionOutcome, HoldOutcome, ReplaceOutcome};
 
@@ -91,8 +91,8 @@ pub enum CommandOperation {
         resource_pool_id: ResourcePoolId,
         /// Human-readable pool name.
         display_name: String,
-        /// Opaque capacity unit.
-        unit: String,
+        /// Immutable fixed-point capacity unit.
+        unit: Unit,
         /// Initial physical capacity.
         capacity_curve: CapacityCurve,
     },

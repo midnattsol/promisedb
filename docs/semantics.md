@@ -14,7 +14,9 @@ Intervals are always half-open:
 
 ## Quantity and slack
 
-`Quantity` is a non-negative `u64`. Claim quantities must be greater than zero. Capacity may be zero.
+`Quantity` is a non-negative `u64` containing integer subunits. Claim quantities must be greater than zero. Capacity may be zero.
+
+Each resource pool has an immutable `Unit { name, subunits_per_unit }`. For a unit named `watts` with `1_000` subunits per unit, quantity `1_500` represents 1.5 watts. Unit names must not be empty and the scale must be greater than zero. Decimal parsing, display formatting, and unit aliases belong to the control API; the engine operates only on integer subunits.
 
 Slack is signed:
 
