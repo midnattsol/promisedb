@@ -9,4 +9,5 @@ pub mod command;
 pub mod domain;
 pub mod engine;
 pub mod event;
+pub mod idempotency;
 pub mod index;

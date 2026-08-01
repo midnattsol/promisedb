@@ -13,6 +13,11 @@ impl ResourcePoolId {
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Returns the stable 16-byte UUID representation.
+    pub fn as_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
 }
 
 /// A named pool with finite capacity measured in one opaque unit.

@@ -13,13 +13,14 @@ pub use capacity_revision::{
 };
 
 use crate::clock::{Clock, SystemClock};
-use crate::command::{Command, CommandOperation, CommandResult};
+use crate::command::{ClientId, Command, CommandOperation, CommandResult, IdempotencyKey};
 use crate::domain::DomainError;
 use crate::domain::{
     Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
     ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Version,
 };
 use crate::event::{Event, EventData, EventKind};
+use crate::idempotency::IdempotencyRecord;
 use crate::index::SlackTimeline;
 use std::collections::BTreeMap;
 
@@ -50,6 +51,7 @@ pub struct Engine {
     slack_timelines: BTreeMap<ResourcePoolId, SlackTimeline>,
     promises: BTreeMap<PromiseId, Promise>,
     events: Vec<Event>,
+    idempotency_records: BTreeMap<(ClientId, IdempotencyKey), IdempotencyRecord>,
     sequence: SequenceNumber,
 }
 
@@ -70,6 +72,7 @@ impl Engine {
             slack_timelines: BTreeMap::new(),
             promises: BTreeMap::new(),
             events: Vec::new(),
+            idempotency_records: BTreeMap::new(),
             sequence: SequenceNumber::new(0),
         }
     }
@@ -94,6 +97,11 @@ impl Engine {
     /// Returns a promise by ID.
     pub fn promise(&self, id: PromiseId) -> Option<&Promise> {
         self.promises.get(&id)
+    }
+
+    /// Returns the number of retained idempotency responses.
+    pub fn idempotency_record_count(&self) -> usize {
+        self.idempotency_records.len()
     }
 
     /// Returns emitted events whose sequence is at least `from_sequence`.

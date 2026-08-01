@@ -72,6 +72,11 @@ impl PromiseId {
     pub fn generate() -> Self {
         Self(Uuid::new_v4())
     }
+
+    /// Returns the stable 16-byte UUID representation.
+    pub fn as_bytes(self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
 }
 
 /// The lifecycle state of a promise.

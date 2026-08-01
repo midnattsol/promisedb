@@ -36,6 +36,8 @@ pub enum DomainError {
     PromiseNotFound,
     /// An operation is not allowed from the promise's current state.
     InvalidPromiseState,
+    /// An idempotency key was reused with a different normalized command.
+    IdempotencyConflict,
     /// The expected promise version does not match its current version.
     VersionConflict,
     /// A promise version cannot be incremented without overflowing.
@@ -72,6 +74,7 @@ impl Display for DomainError {
             Self::PromiseAlreadyExists => "promise already exists with the same identifier",
             Self::PromiseNotFound => "promise does not exist",
             Self::InvalidPromiseState => "operation is not allowed from the current promise state",
+            Self::IdempotencyConflict => "idempotency key was reused with a different command",
             Self::VersionConflict => "expected promise version does not match the current version",
             Self::VersionOverflow => "promise version cannot be incremented",
             Self::SequenceOverflow => "global sequence number cannot be incremented",
