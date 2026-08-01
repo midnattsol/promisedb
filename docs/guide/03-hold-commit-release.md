@@ -22,6 +22,8 @@ Held { expires_at }
 
 A held promise already consumes capacity. This prevents another request from taking the same capacity while the client finishes its workflow.
 
+`HoldOneOf` performs the same transition for the first feasible bundle in an ordered `Choice`. It creates exactly one promise and reports the selected alternative index. Rejected alternatives leave no partial reservation. If all alternatives are unavailable, the result includes conflicts for every alternative and emits no `HoldCreated` event.
+
 ## Commit
 
 Commit confirms a live hold:

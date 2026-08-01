@@ -7,7 +7,9 @@
 mod availability;
 mod capacity_revision;
 
-pub use availability::{AvailabilityConflict, HoldOutcome, ReplaceOutcome};
+pub use availability::{
+    AvailabilityConflict, ChoiceConflict, ChoiceOutcome, HoldOutcome, ReplaceOutcome,
+};
 pub use capacity_revision::{
     AtRiskPromise, CapacityDeficit, CapacityRevisionMode, CapacityRevisionOutcome,
 };
@@ -16,7 +18,7 @@ use crate::clock::{Clock, SystemClock};
 use crate::command::{ClientId, Command, CommandOperation, CommandResult, IdempotencyKey};
 use crate::domain::DomainError;
 use crate::domain::{
-    Bundle, CapacityCurve, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
+    Bundle, CapacityCurve, Choice, Claim, Interval, Promise, PromiseId, PromiseState, Quantity,
     ReplacementState, ResourcePool, ResourcePoolId, SequenceNumber, Timestamp, Unit, Version,
 };
 use crate::event::{Event, EventData, EventKind};
@@ -186,6 +188,13 @@ impl Engine {
             } => self
                 .hold_with_id_at(promise_id, bundle, expires_at, now)
                 .map(CommandResult::HoldCompleted),
+            CommandOperation::HoldOneOf {
+                promise_id,
+                choice,
+                expires_at,
+            } => self
+                .hold_choice_at(promise_id, choice, expires_at, now)
+                .map(CommandResult::ChoiceCompleted),
             CommandOperation::Commit {
                 promise_id,
                 expected_version,
@@ -576,12 +585,74 @@ impl Engine {
                 return Ok(HoldOutcome::Unavailable { conflicts });
             }
         };
+        self.accept_hold(promise_id, bundle, expires_at, now, adjusted_timelines)?;
+        Ok(HoldOutcome::Held(promise_id))
+    }
+
+    /// Holds the first feasible bundle in an ordered choice under a prepared ID.
+    ///
+    /// Due expirations are processed before alternatives are evaluated. Rejected
+    /// alternatives only produce conflict data; their prepared timeline copies are
+    /// discarded. Evaluation stops after the first feasible alternative.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for a duplicate promise ID, invalid deadline, missing pool,
+    /// arithmetic overflow, or sequence exhaustion.
+    pub(crate) fn hold_choice_at(
+        &mut self,
+        promise_id: PromiseId,
+        choice: Choice,
+        expires_at: Timestamp,
+        now: Timestamp,
+    ) -> Result<ChoiceOutcome, DomainError> {
+        self.process_expirations(now)?;
+
+        if self.promises.contains_key(&promise_id) {
+            return Err(DomainError::PromiseAlreadyExists);
+        }
+        if expires_at <= now {
+            return Err(DomainError::InvalidExpiration);
+        }
+
+        let mut all_conflicts = Vec::with_capacity(choice.alternatives().len());
+        for (alternative_index, bundle) in choice.alternatives().iter().enumerate() {
+            match self.evaluate_bundle_admission(bundle)? {
+                BundleAdmission::Available(timelines) => {
+                    self.accept_hold(promise_id, bundle.clone(), expires_at, now, timelines)?;
+                    return Ok(ChoiceOutcome::Held {
+                        promise_id,
+                        alternative_index,
+                    });
+                }
+                BundleAdmission::Unavailable(conflicts) => {
+                    all_conflicts.push(ChoiceConflict {
+                        alternative_index,
+                        conflicts,
+                    });
+                }
+            }
+        }
+
+        Ok(ChoiceOutcome::Unavailable {
+            conflicts: all_conflicts,
+        })
+    }
+
+    fn accept_hold(
+        &mut self,
+        promise_id: PromiseId,
+        bundle: Bundle,
+        expires_at: Timestamp,
+        now: Timestamp,
+        timelines: BTreeMap<ResourcePoolId, SlackTimeline>,
+    ) -> Result<(), DomainError> {
         let next_sequence = self.next_sequence()?;
         let promise = Promise::with_id(promise_id, bundle, expires_at, now, next_sequence)?;
         let version = promise.version();
 
         self.promises.insert(promise_id, promise);
-        self.slack_timelines.extend(adjusted_timelines);
+        self.slack_timelines.extend(timelines);
         self.sequence = next_sequence;
         self.events.push(Event::new(
             next_sequence,
@@ -592,8 +663,7 @@ impl Engine {
                 version,
             },
         ));
-
-        Ok(HoldOutcome::Held(promise_id))
+        Ok(())
     }
 
     /// Atomically holds a bundle using one timestamp read from the engine's clock.
@@ -613,6 +683,25 @@ impl Engine {
     ) -> Result<HoldOutcome, DomainError> {
         let now = self.clock.now()?;
         self.hold_at(bundle, expires_at, now)
+    }
+
+    /// Holds the first feasible alternative using one timestamp from the clock.
+    ///
+    /// The created promise receives an engine-generated ID. Durable callers should
+    /// instead submit [`CommandOperation::HoldOneOf`] with a control-plane ID.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the clock cannot provide a timestamp or an alternative
+    /// cannot be evaluated safely. Insufficient capacity for every alternative is a
+    /// normal [`ChoiceOutcome::Unavailable`] result.
+    pub fn hold_one_of(
+        &mut self,
+        choice: Choice,
+        expires_at: Timestamp,
+    ) -> Result<ChoiceOutcome, DomainError> {
+        let now = self.clock.now()?;
+        self.hold_choice_at(PromiseId::generate(), choice, expires_at, now)
     }
 
     /// Commits a held promise using an authoritative timestamp.
@@ -1338,6 +1427,10 @@ mod tests {
         Bundle::new(claims).expect("the bundle should be valid")
     }
 
+    fn choice(alternatives: Vec<Bundle>) -> Choice {
+        Choice::new(alternatives).expect("the choice should be valid")
+    }
+
     fn command_with_key(key: &str, operation: CommandOperation) -> Command {
         Command::new(
             crate::command::ClientId::new("test-client"),
@@ -1568,6 +1661,213 @@ mod tests {
         assert_eq!(original, retry);
         assert_eq!(engine.promises.len(), 1);
         assert_eq!(engine.sequence().get(), 1);
+    }
+
+    #[test]
+    fn hold_one_of_selects_the_second_alternative_when_the_first_is_unavailable() {
+        let (mut engine, pool_id) = engine_with_pool(5);
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldOneOf {
+                    promise_id,
+                    choice: choice(vec![
+                        bundle(vec![claim(pool_id, 0, 10, 6)]),
+                        bundle(vec![claim(pool_id, 0, 10, 4)]),
+                    ]),
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .expect("the second alternative should be held");
+
+        assert_eq!(
+            result,
+            CommandResult::ChoiceCompleted(ChoiceOutcome::Held {
+                promise_id,
+                alternative_index: 1,
+            })
+        );
+        assert_eq!(
+            engine.promise(promise_id).unwrap().bundle().claims()[0].quantity(),
+            4
+        );
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(1));
+        assert_eq!(engine.sequence().get(), 1);
+        assert_eq!(engine.events.len(), 1);
+    }
+
+    #[test]
+    fn hold_one_of_stops_after_the_first_feasible_alternative() {
+        let (mut engine, pool_id) = engine_with_pool(5);
+        let missing_pool_id = ResourcePoolId::generate();
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldOneOf {
+                    promise_id,
+                    choice: choice(vec![
+                        bundle(vec![claim(pool_id, 0, 10, 2)]),
+                        bundle(vec![claim(missing_pool_id, 0, 10, 1)]),
+                    ]),
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .expect("the missing pool in the later alternative must not be evaluated");
+
+        assert!(matches!(
+            result,
+            CommandResult::ChoiceCompleted(ChoiceOutcome::Held {
+                alternative_index: 0,
+                ..
+            })
+        ));
+        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(3));
+    }
+
+    #[test]
+    fn hold_one_of_returns_conflicts_for_every_alternative() {
+        let (mut engine, pool_id) = engine_with_pool(0);
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldOneOf {
+                    promise_id,
+                    choice: choice(vec![
+                        bundle(vec![claim(pool_id, 0, 10, 1)]),
+                        bundle(vec![claim(pool_id, 10, 20, 2)]),
+                    ]),
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .expect("unavailability should be a normal outcome");
+        let CommandResult::ChoiceCompleted(ChoiceOutcome::Unavailable { conflicts }) = result
+        else {
+            panic!("every alternative should be unavailable");
+        };
+
+        assert_eq!(conflicts.len(), 2);
+        assert_eq!(conflicts[0].alternative_index(), 0);
+        assert_eq!(conflicts[0].conflicts().len(), 1);
+        assert_eq!(conflicts[0].conflicts()[0].required_quantity(), 1);
+        assert_eq!(conflicts[1].alternative_index(), 1);
+        assert_eq!(conflicts[1].conflicts().len(), 1);
+        assert_eq!(conflicts[1].conflicts()[0].required_quantity(), 2);
+        assert!(engine.promise(promise_id).is_none());
+        assert_eq!(engine.sequence().get(), 0);
+        assert!(engine.events.is_empty());
+        assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(0));
+    }
+
+    #[test]
+    fn rejected_multi_pool_alternative_leaves_no_partial_consumption() {
+        let (mut engine, first_pool_id) = engine_with_pool(5);
+        let second_pool_id =
+            create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(0));
+        let baseline_sequence = engine.sequence().get();
+        let baseline_events = engine.events.len();
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldOneOf {
+                    promise_id,
+                    choice: choice(vec![
+                        bundle(vec![
+                            claim(first_pool_id, 0, 10, 5),
+                            claim(second_pool_id, 0, 10, 1),
+                        ]),
+                        bundle(vec![claim(first_pool_id, 0, 10, 5)]),
+                    ]),
+                    expires_at: EXPIRES_AT,
+                }),
+                NOW,
+            )
+            .expect("the second alternative should fit atomically");
+
+        assert!(matches!(
+            result,
+            CommandResult::ChoiceCompleted(ChoiceOutcome::Held {
+                alternative_index: 1,
+                ..
+            })
+        ));
+        assert_eq!(
+            engine.slack_timeline(first_pool_id).unwrap().slack_at(0),
+            Ok(0)
+        );
+        assert_eq!(
+            engine.slack_timeline(second_pool_id).unwrap().slack_at(0),
+            Ok(0)
+        );
+        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.sequence().get(), baseline_sequence + 1);
+        assert_eq!(engine.events.len(), baseline_events + 1);
+    }
+
+    #[test]
+    fn exact_hold_one_of_retry_does_not_reapply_or_process_expirations() {
+        let (mut engine, pool_id) = engine_with_pool(5);
+        let promise_id = PromiseId::generate();
+        let operation = CommandOperation::HoldOneOf {
+            promise_id,
+            choice: choice(vec![bundle(vec![claim(pool_id, 0, 10, 2)])]),
+            expires_at: EXPIRES_AT,
+        };
+        let first = engine
+            .apply(command_with_key("hold-one-of", operation.clone()), NOW)
+            .unwrap();
+        let sequence = engine.sequence();
+        let event_count = engine.events.len();
+        let retry = engine
+            .apply(command_with_key("hold-one-of", operation), EXPIRES_AT)
+            .unwrap();
+
+        assert_eq!(retry, first);
+        assert_eq!(engine.sequence(), sequence);
+        assert_eq!(engine.events.len(), event_count);
+        assert!(matches!(
+            engine.promise(promise_id).unwrap().state(),
+            PromiseState::Held { .. }
+        ));
+        assert_eq!(engine.idempotency_record_count(), 1);
+    }
+
+    #[test]
+    fn hold_one_of_processes_expirations_before_selecting() {
+        let (mut engine, pool_id) = engine_with_pool(1);
+        let expired_id = add_held_promise_at(&mut engine, claim(pool_id, 0, 10, 1), 100, 1);
+        let promise_id = PromiseId::generate();
+        let result = engine
+            .apply(
+                command(CommandOperation::HoldOneOf {
+                    promise_id,
+                    choice: choice(vec![bundle(vec![claim(pool_id, 0, 10, 1)])]),
+                    expires_at: EXPIRES_AT,
+                }),
+                100,
+            )
+            .expect("the alternative should fit after expiration");
+
+        assert!(matches!(
+            result,
+            CommandResult::ChoiceCompleted(ChoiceOutcome::Held {
+                alternative_index: 0,
+                ..
+            })
+        ));
+        assert_eq!(
+            engine.promise(expired_id).unwrap().state(),
+            PromiseState::Expired
+        );
+        assert_eq!(engine.sequence().get(), 3);
+        assert_eq!(engine.events.len(), 2);
+        assert_eq!(engine.events[0].kind(), EventKind::HoldExpired);
+        assert_eq!(engine.events[1].kind(), EventKind::HoldCreated);
+        assert_eq!(engine.events[0].sequence().get(), 2);
+        assert_eq!(engine.events[1].sequence().get(), 3);
     }
 
     #[test]

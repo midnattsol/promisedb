@@ -64,6 +64,7 @@ IdempotencyKey
 OperationTag
 canonical field order
 bundle claim normalization
+choice alternative order
 cached CommandResponse
 ```
 

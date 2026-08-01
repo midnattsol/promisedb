@@ -6,6 +6,7 @@
 
 mod bundle;
 mod capacity_curve;
+mod choice;
 mod claim;
 mod error;
 mod interval;
@@ -15,6 +16,7 @@ mod unit;
 
 pub use bundle::Bundle;
 pub use capacity_curve::{CapacityCurve, CapacitySegment};
+pub use choice::Choice;
 pub use claim::Claim;
 pub use error::DomainError;
 pub use interval::Interval;

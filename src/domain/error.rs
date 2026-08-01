@@ -26,6 +26,8 @@ pub enum DomainError {
     InvalidExpiration,
     /// A bundle contains no claims.
     EmptyBundle,
+    /// A choice contains no alternative bundles.
+    EmptyChoice,
     /// A resource pool already exists with the same identifier.
     ResourcePoolAlreadyExists,
     /// A referenced resource pool does not exist.
@@ -69,6 +71,7 @@ impl Display for DomainError {
             Self::IndexOverflow => "derived index arithmetic overflowed",
             Self::InvalidExpiration => "expiration deadline must be in the future",
             Self::EmptyBundle => "bundle must contain at least one claim",
+            Self::EmptyChoice => "choice must contain at least one alternative bundle",
             Self::ResourcePoolAlreadyExists => {
                 "resource pool already exists with the same identifier"
             }

@@ -35,7 +35,7 @@ clone promise or timeline
 → publish all affected objects
 ```
 
-Do not mutate one pool and then discover that another pool fails. Do not release an old promise before evaluating replacement usage.
+Do not mutate one pool and then discover that another pool fails. Do not release an old promise before evaluating replacement usage. For an ordered choice, evaluate each alternative against unchanged current state, retain only conflict data for rejected alternatives, and publish only the first prepared feasible bundle.
 
 ## Expirations
 

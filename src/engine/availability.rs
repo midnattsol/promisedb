@@ -65,6 +65,42 @@ pub enum HoldOutcome {
     },
 }
 
+/// Conflicts that prevented one alternative in an ordered choice from being held.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ChoiceConflict {
+    pub(super) alternative_index: usize,
+    pub(super) conflicts: Vec<AvailabilityConflict>,
+}
+
+impl ChoiceConflict {
+    /// Returns the zero-based position of the unavailable alternative.
+    pub fn alternative_index(&self) -> usize {
+        self.alternative_index
+    }
+
+    /// Returns every normalized conflict for this alternative.
+    pub fn conflicts(&self) -> &[AvailabilityConflict] {
+        &self.conflicts
+    }
+}
+
+/// The normal business outcome of attempting to hold an ordered choice.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ChoiceOutcome {
+    /// The first feasible alternative was held atomically.
+    Held {
+        /// The predetermined identity of the created promise.
+        promise_id: PromiseId,
+        /// The zero-based position of the selected alternative.
+        alternative_index: usize,
+    },
+    /// No alternative was feasible and no promise was created.
+    Unavailable {
+        /// Conflicts for every alternative, in choice order.
+        conflicts: Vec<ChoiceConflict>,
+    },
+}
+
 /// The normal business outcome of an attempted atomic replacement.
 ///
 /// Engine failures and invalid requests remain in the outer `Result`; insufficient

@@ -58,6 +58,6 @@ If the same pair is reused with a different operation, PromiseDB returns `Idempo
 
 Commands are converted to a stable binary representation and hashed with BLAKE3. The format uses explicit tags, fixed byte order, lengths for strings and collections, and stable UUID bytes.
 
-Bundle claim order has no meaning, so claims are sorted before hashing. Two bundles containing the same claims in different input orders have the same command hash.
+Bundle claim order has no meaning, so claims are sorted before hashing. Two bundles containing the same claims in different input orders have the same command hash. Choice alternative order controls selection, so canonical hashing preserves that order while normalizing claims inside each bundle.
 
 Next: [Following one command through the engine](06-following-a-command.md).

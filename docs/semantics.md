@@ -44,9 +44,9 @@ A new hold cannot consume capacity in an existing deficit. An atomic replacement
 
 ## Claims and bundles
 
-A claim consumes a positive quantity from one resource pool during one interval. A bundle is a non-empty collection of claims accepted or rejected atomically.
+A claim consumes a positive quantity from one resource pool during one interval. A bundle is a non-empty collection of claims accepted or rejected atomically. A `Choice` is a non-empty ordered collection of alternative bundles.
 
-Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together.
+Multiple claims in the same bundle may reference the same pool and overlap. Their quantities are evaluated together. Choice order is significant: alternatives are evaluated from index zero and the first feasible bundle is selected.
 
 ## Hold admission
 
@@ -62,6 +62,10 @@ Insufficient capacity is not an engine error. An unavailable outcome contains ev
 Conflicts are ordered canonically by interval start, resource pool ID, and interval end. Adjacent conflicts within one pool are merged only when their quantities and conflicting promise IDs are identical. Capacity gaps are reported as zero availability.
 
 Unavailable holds do not create a promise, modify a timeline, or consume a sequence for the requested hold. Expirations processed before admission remain committed.
+
+`HoldOneOf` applies the same admission rules to an ordered `Choice`, using one control-plane `PromiseId` and one `expires_at`. It stops at the first feasible alternative and creates exactly one promise containing that complete bundle. Rejected alternatives publish no promise, timeline, sequence, or event changes; prepared timeline copies are discarded.
+
+`ChoiceOutcome::Held` identifies the promise and selected zero-based alternative index. If none fit, `Unavailable` returns one `ChoiceConflict` per alternative in choice order. Each entry contains its alternative index and that bundle's complete, canonically ordered `Vec<AvailabilityConflict>`. The requested operation then makes no state change.
 
 ## Promise lifecycle
 
@@ -92,7 +96,7 @@ Every internal mutation is represented by a `Command` containing a common `(Clie
 
 The pair `(ClientId, IdempotencyKey)` identifies one command. PromiseDB hashes the normalized `CommandOperation` with BLAKE3 and caches its complete original response. An exact retry returns that response without processing expirations, consuming a sequence, emitting events, or inspecting current state. Reusing the pair with a different normalized operation returns `IdempotencyConflict`.
 
-Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing.
+Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing. Choice alternative order is significant and is preserved in the canonical representation, while each alternative bundle still uses canonical claim ordering.
 
 A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
 

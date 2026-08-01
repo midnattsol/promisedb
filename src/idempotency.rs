@@ -2,8 +2,8 @@
 
 use crate::command::{CommandOperation, CommandResult};
 use crate::domain::{
-    Bundle, CapacityCurve, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId, Unit,
-    Version,
+    Bundle, CapacityCurve, Choice, Claim, Interval, PromiseId, ReplacementState, ResourcePoolId,
+    Unit, Version,
 };
 use crate::engine::CapacityRevisionMode;
 
@@ -27,6 +27,7 @@ enum OperationTag {
     Release = 5,
     Replace = 6,
     ProcessExpirations = 7,
+    HoldOneOf = 8,
 }
 
 impl OperationTag {
@@ -35,6 +36,7 @@ impl OperationTag {
             CommandOperation::CreateResourcePool { .. } => Self::CreateResourcePool,
             CommandOperation::ReviseCapacity { .. } => Self::ReviseCapacity,
             CommandOperation::Hold { .. } => Self::Hold,
+            CommandOperation::HoldOneOf { .. } => Self::HoldOneOf,
             CommandOperation::Commit { .. } => Self::Commit,
             CommandOperation::Release { .. } => Self::Release,
             CommandOperation::Replace { .. } => Self::Replace,
@@ -163,6 +165,15 @@ impl CanonicalHash for Bundle {
     }
 }
 
+impl CanonicalHash for Choice {
+    fn update_hash(&self, hasher: &mut blake3::Hasher) {
+        update_length(self.alternatives().len(), hasher);
+        for bundle in self.alternatives() {
+            bundle.update_hash(hasher);
+        }
+    }
+}
+
 impl CanonicalHash for CapacityRevisionMode {
     fn update_hash(&self, hasher: &mut blake3::Hasher) {
         let tag = match self {
@@ -246,6 +257,7 @@ pub fn hash_operation(operation: &CommandOperation) -> CommandHash {
 /// - encode strings and collections with explicit lengths;
 /// - encode UUID-backed IDs as their 16 stable bytes;
 /// - sort bundle claims by pool ID, interval start, interval end, and quantity;
+/// - preserve the order of alternatives in a choice;
 /// - never depend on Rust memory layout or `Hash` implementations.
 fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::Hasher) {
     OperationTag::for_operation(operation).update_hash(hasher);
@@ -278,6 +290,15 @@ fn write_canonical_operation(operation: &CommandOperation, hasher: &mut blake3::
         } => {
             promise_id.update_hash(hasher);
             bundle.update_hash(hasher);
+            expires_at.update_hash(hasher);
+        }
+        CommandOperation::HoldOneOf {
+            promise_id,
+            choice,
+            expires_at,
+        } => {
+            promise_id.update_hash(hasher);
+            choice.update_hash(hasher);
             expires_at.update_hash(hasher);
         }
         CommandOperation::Commit {
@@ -335,6 +356,26 @@ mod tests {
         };
 
         assert_eq!(hash_operation(&first), hash_operation(&reordered));
+    }
+
+    #[test]
+    fn changing_choice_order_changes_the_hash() {
+        let pool_id = ResourcePoolId::generate();
+        let promise_id = crate::domain::PromiseId::generate();
+        let first_bundle = Bundle::new(vec![claim(pool_id, 0, 10, 1)]).unwrap();
+        let second_bundle = Bundle::new(vec![claim(pool_id, 0, 10, 2)]).unwrap();
+        let first = CommandOperation::HoldOneOf {
+            promise_id,
+            choice: Choice::new(vec![first_bundle.clone(), second_bundle.clone()]).unwrap(),
+            expires_at: 100,
+        };
+        let reordered = CommandOperation::HoldOneOf {
+            promise_id,
+            choice: Choice::new(vec![second_bundle, first_bundle]).unwrap(),
+            expires_at: 100,
+        };
+
+        assert_ne!(hash_operation(&first), hash_operation(&reordered));
     }
 
     #[test]

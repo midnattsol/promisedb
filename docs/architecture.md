@@ -16,7 +16,7 @@ src/
 
 ### Domain
 
-The domain owns structural invariants for intervals, fixed-point units, claims, bundles, promises, resource pools, and capacity curves. Domain objects do not read clocks or global state. Each pool fixes a unit name and integer subunit scale; decimal conversion remains outside the engine.
+The domain owns structural invariants for intervals, fixed-point units, claims, bundles, ordered choices, promises, resource pools, and capacity curves. Domain objects do not read clocks or global state. Each pool fixes a unit name and integer subunit scale; decimal conversion remains outside the engine.
 
 ### Command boundary
 
@@ -56,9 +56,9 @@ The engine creates a timeline with each resource pool and keeps it synchronized 
 
 Capacity revision reconstructs a candidate timeline from the replacement curve and active promises. Strict mode publishes only non-negative slack; force mode may publish negative slack as explicit deficit intervals. At-risk promises are derived by intersecting active claims with those intervals, so deficit metadata remains reconstructible rather than authoritative state.
 
-Timeline changes are first applied to copies of every affected pool's index. Every pool is evaluated so an unavailable operation can return all conflicts in canonical order. The engine publishes prepared copies only when the complete bundle succeeds, preventing partial index updates across pools.
+Timeline changes are first applied to copies of every affected pool's index. Every pool is evaluated so an unavailable bundle can return all conflicts in canonical order. The engine publishes prepared copies only when the complete bundle succeeds, preventing partial index updates across pools. `HoldOneOf` evaluates alternatives sequentially against unchanged current timelines, discards copies and records conflicts for each rejection, and publishes only the first feasible alternative.
 
-Hold admission uses `SlackTimeline` as its production hot path: preparing adjusted timeline copies both validates the complete bundle and computes the index state to publish. Replace first restores the old bundle on temporary timeline copies, evaluates the new bundle against those overrides, and publishes only the resulting final timelines. Pools used only by the old bundle remain restored; shared and new pools receive the newly adjusted timelines. The slower calculation from capacity curves and active promises is compiled only for differential tests, where it remains a correctness oracle. Resource pools and promises remain authoritative and can reconstruct every timeline.
+Hold admission uses `SlackTimeline` as its production hot path: preparing adjusted timeline copies both validates the complete bundle and computes the index state to publish. Ordinary holds and selected choice alternatives share the same accepted-hold publication path and emit the existing `HoldCreated` event. Replace first restores the old bundle on temporary timeline copies, evaluates the new bundle against those overrides, and publishes only the resulting final timelines. Pools used only by the old bundle remain restored; shared and new pools receive the newly adjusted timelines. The slower calculation from capacity curves and active promises is compiled only for differential tests, where it remains a correctness oracle. Resource pools and promises remain authoritative and can reconstruct every timeline.
 
 ## Authoritative state
 

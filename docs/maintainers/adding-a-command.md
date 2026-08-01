@@ -19,8 +19,8 @@ Edit `src/idempotency.rs`.
 - Use `CanonicalHash` implementations or add a private implementation for the new value type.
 - Use fixed-width big-endian integers.
 - Prefix variable-length strings and collections with lengths.
-- Normalize collections only when their order is semantically irrelevant.
-- Add a hash test proving that meaningful field changes alter the hash.
+- Normalize collections only when their order is semantically irrelevant. Preserve ordered preference lists such as `Choice::alternatives`.
+- Add a hash test proving that meaningful field changes, including preference order, alter the hash.
 - Add or update a golden vector when changing the format intentionally.
 
 Changing canonical bytes is a compatibility change because recovered idempotency records depend on them.
@@ -59,8 +59,8 @@ Add tests for:
 
 - canonical hash stability and field sensitivity;
 - successful dispatch;
-- structured business rejection;
-- failure without partial mutation;
+- structured business rejection, including every required alternative conflict;
+- failure without partial mutation across pools or rejected alternatives;
 - exact retry without sequence or event changes;
 - same key with a different payload;
 - expiration ordering when relevant;
