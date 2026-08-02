@@ -1,60 +1,81 @@
 # Storage status
 
-PromiseDB has storage **boilerplate**, not an integrated durable WAL.
+PromiseDB now has a generic, versioned WAL record envelope in addition to its command
+codec and raw WAL backends. Engine publication ordering is not yet integrated, so the
+crate is still an in-memory state machine from an end-to-end durability perspective.
 
-## Implemented
+## WAL record format version 1
 
-- `storage::encode_command` and `storage::decode_command` provide a deterministic,
-  versioned binary representation of complete commands. Command format version `1`
-  is now defined to use explicit tags, little-endian fixed-width integers,
-  little-endian `u32`-length-prefixed strings and collections, and stable UUID bytes.
-  It preserves bundle claim input order and ordered choice alternatives.
-- Decoding rebuilds domain values through validated constructors and reports
-  structured `StorageError` values.
+`storage::record::Record` owns three values: a non-zero `RecordSequence`, an `i64`
+`Timestamp`, and an opaque `Vec<u8>` payload. The record layer neither knows nor decodes
+`Command`; transitioning command codec output into record payloads is pending work.
+
+Every record consists of a fixed 32-byte header, payload bytes, zero alignment padding,
+and a final 16-byte checksum:
+
+| Byte range | Field | Encoding |
+| --- | --- | --- |
+| `0..4` | magic | ASCII `PDBW` |
+| `4` | record format version | `u8`, currently `1` |
+| `5` | flags | `u8`, must be `0` in version 1 |
+| `6..8` | header length | little-endian `u16`, must be `32` |
+| `8..12` | total record length | little-endian `u32` |
+| `12..16` | payload length | little-endian `u32` |
+| `16..24` | record sequence | little-endian `u64` |
+| `24..32` | timestamp | little-endian `i64` |
+| `32..` | body | payload, zero padding, checksum |
+
+The total record length includes the header and checksum and is always divisible by
+eight. Because the 32-byte header and 16-byte checksum are already aligned, padding is
+`(8 - payload_len % 8) % 8`, from zero through seven bytes. Padding bytes must be zero.
+The format ceiling is `4,294,967,288`, the largest 8-byte-aligned value representable by
+`u32`.
+
+The checksum is BLAKE3-128: the first 16 bytes of the BLAKE3 digest over the contiguous
+`header || payload || padding`. The trailing checksum bytes are excluded from their own
+coverage.
+
+`record::encode` accepts explicit `RecordLimits`, validates representability and the
+configured maximum before reserving, and builds the result with one allocation. The
+default maximum total record size is 64 MiB. Limits must be at least 48 bytes, no larger
+than the format ceiling, and divisible by eight.
+
+## Reading and recovery
+
+`RecordReader<R>` owns a generic `Read`, tracks its byte offset, and enforces strict
+record sequencing. `RecordReader::new` expects `RecordSequence::FIRST`; an explicit
+starting sequence can be supplied with `RecordReader::with_expected_sequence`.
+
+The reader:
+
+- returns clean EOF only when zero bytes are read at a record boundary;
+- reports every non-empty truncated prefix as a structured partial tail;
+- validates magic, version, flags, header and body lengths, sequence, zero padding, and
+  checksum without resynchronizing;
+- rejects a declared record size against `RecordLimits` before allocating its body;
+- reports complete corruption with a structured reason and the failing record's byte
+  offset; and
+- tolerates ordinary short reads and interrupted reads.
+
+`storage::recovery::recover` is a generic scanner that uses those limits and returns
+validated opaque records in strict sequence order. It performs no command decoding and
+does not apply records to `Engine`.
+
+Record-version errors and command-codec version errors are distinct. The command codec
+temporarily retains the compatibility name `StorageError::UnsupportedVersion`, while
+WAL framing reports `StorageError::UnsupportedRecordVersion`.
+
+## Other implemented storage pieces
+
+- `storage::encode_command` and `storage::decode_command` provide the existing
+  deterministic version-1 representation of complete commands. Connecting that codec
+  to the new opaque record payload is intentionally pending.
 - `WalBackend` defines raw `append`, `flush`, and `sync` operations.
   `MemoryWal` retains bytes and operation counters for tests. `FileWal::create`
   exclusively creates a new path, while `FileWal::open` requires an existing path.
 - `Durability` and `persist` apply `None`, `Flush`, or `Sync` policy to one owned
   `Vec<u8>`.
 
-## Learner-owned TODO
-
-`storage::record` deliberately leaves record framing and reading as `todo!`. The
-learner still owns these durable-format decisions:
-
-- checksum algorithm, checksum bytes, and checksum coverage;
-- clean EOF, partial-tail, and corrupt-record reader behavior.
-
-Every WAL record has this fixed serialized 32-byte header:
-
-| Byte range | Field | Encoding |
-| --- | --- | --- |
-| `0..4` | magic | ASCII `PDBW` |
-| `4..8` | total remaining record length | little-endian `u32` |
-| `8` | record format version | `u8` |
-| `9..16` | reserved | seven zero bytes |
-| `16..24` | record sequence | little-endian `u64` |
-| `24..32` | timestamp | little-endian `i64` |
-
-A different complete magic signature identifies corruption rather than a PromiseDB
-record. The length counts every byte after the length field itself, including bytes
-`8..32` of the fixed header, the command payload, and the as-yet-unselected checksum.
-
-WAL records have their own mandatory monotonic `record_sequence`, separate from
-engine event sequences. Record sequences start at `1`; zero means that the WAL is
-empty and is not a valid `RecordSequence`. A command may produce zero, one, or many
-domain events, so these counters intentionally describe different orders.
-
-Record encoding can allocate its final `Vec<u8>`, write the header, and call the
-internal `encode_command_into` helper to append the command directly before passing
-that same `Vec<u8>` to `persist`; no command-payload `Vec` or boxed-slice conversion is
-required.
-
-Ignored guide tests name the remaining required cases without selecting those designs.
-`storage::recovery::recover` is only compile-clean control-flow scaffolding and
-cannot run until the record reader exists. It does not replay into `Engine`.
-
-No engine publication ordering has been integrated. Consequently, the presence of
-raw file operations and a command codec must not be interpreted as a durability
-guarantee: PromiseDB remains an in-memory state machine until record framing,
-recovery, and engine/WAL ordering are designed and implemented together.
+No engine/WAL publication ordering has been integrated. Raw file operations, command
+encoding, and validated record framing therefore do not yet constitute an end-to-end
+durability guarantee.

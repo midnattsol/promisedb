@@ -1,7 +1,7 @@
-//! Storage primitives and WAL scaffolding.
+//! Storage primitives, command payload codecs, and generic WAL framing.
 //!
-//! Command encoding and raw byte backends are implemented. Record framing,
-//! checksums, recovery, and engine publication ordering are not complete.
+//! Record payloads are deliberately opaque. Command codec integration and engine
+//! publication ordering remain separate work.
 
 mod backend;
 mod codec;
@@ -11,4 +11,6 @@ pub mod recovery;
 
 pub use backend::{Durability, FileWal, MemoryWal, WalBackend, persist};
 pub use codec::{COMMAND_FORMAT_VERSION, decode_command, encode_command};
-pub use error::StorageError;
+pub use error::{RecordCorruption, StorageError};
+pub use record::{Record, RecordLimits, RecordReader, RecordSequence, encode as encode_record};
+pub use recovery::recover;
