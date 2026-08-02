@@ -199,6 +199,14 @@ impl<B: WalBackend> Database<B> {
         self.poisoned
     }
 
+    pub(crate) fn backend_mut(&mut self) -> &mut B {
+        &mut self.backend
+    }
+
+    pub(crate) fn engine_snapshot(&self) -> crate::engine::EngineSnapshot {
+        self.engine.capture_snapshot()
+    }
+
     /// Returns the next record sequence, or `None` after log exhaustion.
     pub fn next_record_sequence(&self) -> Option<RecordSequence> {
         self.next_record_sequence

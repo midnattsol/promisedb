@@ -10,6 +10,7 @@ mod error;
 mod file;
 pub mod record;
 pub mod recovery;
+pub mod snapshot;
 pub(crate) mod transition;
 
 pub use backend::{Durability, FileWal, MemoryWal, WalBackend, persist};
@@ -21,6 +22,7 @@ pub use error::{RecordCorruption, StorageError};
 pub use file::{
     DEFAULT_SEGMENT_TARGET, FileDatabase, FileDatabaseError, FileDatabaseOptions,
     MIN_SEGMENT_TARGET, ManifestError, SEGMENT_HEADER_LEN, SegmentHeaderError, SegmentedWal,
+    SnapshotOutcome,
 };
 pub use record::{
     Record, RecordLimits, RecordPayloadWriter, RecordReader, RecordSequence,
@@ -30,3 +32,6 @@ pub use recovery::{
     EngineRecovery, RecoveryError, RecoveryInstallError, RecoveryOutcome, recover, recover_engine,
     recover_engine_with_expected,
 };
+pub use snapshot::{SnapshotError, SnapshotLimits};
+
+pub(crate) const STATE_MACHINE_SEMANTICS_VERSION: u32 = 1;

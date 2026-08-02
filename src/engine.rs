@@ -102,6 +102,21 @@ impl Clone for EngineState {
 #[cfg(test)]
 thread_local! {
     static ENGINE_STATE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static SNAPSHOT_RESTORES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+    static INDEX_REBUILDS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Resets thread-local snapshot recovery instrumentation.
+#[cfg(test)]
+pub(crate) fn reset_snapshot_recovery_counts() {
+    SNAPSHOT_RESTORES.set(0);
+    INDEX_REBUILDS.set(0);
+}
+
+/// Returns snapshot restores and index rebuilds on this test thread.
+#[cfg(test)]
+pub(crate) fn snapshot_recovery_counts() -> (usize, usize) {
+    (SNAPSHOT_RESTORES.get(), INDEX_REBUILDS.get())
 }
 
 impl EngineState {
@@ -120,6 +135,28 @@ impl EngineState {
 /// Monotonic publication generation, independent of the domain event sequence.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub(crate) struct PublicationRevision(u128);
+
+impl PublicationRevision {
+    pub(crate) fn new(value: u128) -> Self {
+        Self(value)
+    }
+
+    pub(crate) fn get(self) -> u128 {
+        self.0
+    }
+}
+
+/// Canonical authoritative state captured at a snapshot boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct EngineSnapshot {
+    pub(crate) resource_pools: Vec<ResourcePool>,
+    pub(crate) promises: Vec<Promise>,
+    pub(crate) events: Vec<Event>,
+    pub(crate) idempotency_records: Vec<(ClientId, IdempotencyKey, CommandHash, CommandResponse)>,
+    pub(crate) sequence: SequenceNumber,
+    pub(crate) publication_revision: PublicationRevision,
+    pub(crate) events_pruned_through: SequenceNumber,
+}
 
 /// A durable, codec-stable description of one first-seen command's effects.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -249,6 +286,77 @@ impl DurableTransition {
     }
 }
 
+fn response_references_valid(
+    response: &CommandResponse,
+    pools: &BTreeMap<ResourcePoolId, ResourcePool>,
+    promises: &BTreeMap<PromiseId, Promise>,
+    sequence: SequenceNumber,
+) -> bool {
+    let conflicts_valid = |conflicts: &[AvailabilityConflict]| {
+        conflicts.iter().all(|conflict| {
+            pools.contains_key(&conflict.resource_pool_id())
+                && conflict
+                    .conflicting_promise_ids()
+                    .iter()
+                    .all(|id| promises.contains_key(id))
+        })
+    };
+    match response {
+        Err(_) => true,
+        Ok(CommandResult::ResourcePoolCreated { resource_pool_id }) => {
+            pools.contains_key(resource_pool_id)
+        }
+        Ok(CommandResult::CapacityRevised(outcome)) => {
+            outcome.sequence() <= sequence
+                && outcome.deficits().iter().all(|deficit| {
+                    pools.contains_key(&deficit.resource_pool_id())
+                        && deficit
+                            .affected_promise_ids()
+                            .iter()
+                            .all(|id| promises.contains_key(id))
+                })
+                && outcome
+                    .affected_promise_ids()
+                    .iter()
+                    .all(|id| promises.contains_key(id))
+        }
+        Ok(CommandResult::HoldCompleted(HoldOutcome::Held(id))) => promises.contains_key(id),
+        Ok(CommandResult::HoldCompleted(HoldOutcome::Unavailable { conflicts })) => {
+            conflicts_valid(conflicts)
+        }
+        Ok(CommandResult::ChoiceCompleted(ChoiceOutcome::Held { promise_id, .. })) => {
+            promises.contains_key(promise_id)
+        }
+        Ok(CommandResult::ChoiceCompleted(ChoiceOutcome::Unavailable { conflicts })) => conflicts
+            .iter()
+            .all(|conflict| conflicts_valid(conflict.conflicts())),
+        Ok(CommandResult::SlotCompleted(SlotOutcome::Held { promise_id, .. })) => {
+            promises.contains_key(promise_id)
+        }
+        Ok(CommandResult::SlotCompleted(SlotOutcome::Unavailable { .. }))
+        | Ok(CommandResult::ExpirationsProcessed { .. }) => true,
+        Ok(CommandResult::PromiseCommitted {
+            promise_id,
+            version,
+        })
+        | Ok(CommandResult::PromiseReleased {
+            promise_id,
+            version,
+        }) => promises
+            .get(promise_id)
+            .is_some_and(|promise| *version <= promise.version()),
+        Ok(CommandResult::PromiseReplaced(ReplaceOutcome::Replaced {
+            promise_id,
+            version,
+        })) => promises
+            .get(promise_id)
+            .is_some_and(|promise| *version <= promise.version()),
+        Ok(CommandResult::PromiseReplaced(ReplaceOutcome::Unavailable { conflicts })) => {
+            conflicts_valid(conflicts)
+        }
+    }
+}
+
 impl Engine {
     /// Creates an empty engine backed by the host system clock.
     pub fn new() -> Self {
@@ -265,6 +373,133 @@ impl Engine {
             state: EngineState::empty(),
             publication_revision: PublicationRevision::default(),
         }
+    }
+
+    /// Captures authoritative state in canonical map-key order.
+    pub(crate) fn capture_snapshot(&self) -> EngineSnapshot {
+        EngineSnapshot {
+            resource_pools: self.state.resource_pools.values().cloned().collect(),
+            promises: self.state.promises.values().cloned().collect(),
+            events: self.state.events.clone(),
+            idempotency_records: self
+                .state
+                .idempotency_records
+                .iter()
+                .map(|((client, key), record)| {
+                    (
+                        client.clone(),
+                        key.clone(),
+                        record.command_hash(),
+                        record.response().clone(),
+                    )
+                })
+                .collect(),
+            sequence: self.state.sequence,
+            publication_revision: self.publication_revision,
+            events_pruned_through: SequenceNumber::new(0),
+        }
+    }
+
+    /// Validates and restores authoritative snapshot state without derived indexes.
+    pub(crate) fn restore_snapshot_unindexed(
+        snapshot: EngineSnapshot,
+    ) -> Result<Self, InstallError> {
+        #[cfg(test)]
+        SNAPSHOT_RESTORES.set(SNAPSHOT_RESTORES.get() + 1);
+        if snapshot.events_pruned_through.get() != 0 {
+            return Err(InstallError::DomainInvariant);
+        }
+        let sequence = snapshot.sequence;
+        let mut resource_pools = BTreeMap::new();
+        let mut previous_pool = None;
+        for pool in snapshot.resource_pools {
+            let id = pool.id();
+            if previous_pool.is_some_and(|previous| previous >= id) {
+                return Err(InstallError::EntityIdentity);
+            }
+            previous_pool = Some(id);
+            resource_pools.insert(id, pool);
+        }
+        let mut promises = BTreeMap::new();
+        let mut previous_promise = None;
+        for promise in snapshot.promises {
+            let id = promise.id();
+            if previous_promise.is_some_and(|previous| previous >= id)
+                || promise.created_sequence().get() == 0
+                || promise.created_sequence() > promise.updated_sequence()
+                || promise.updated_sequence() > sequence
+                || promise
+                    .bundle()
+                    .claims()
+                    .iter()
+                    .any(|claim| !resource_pools.contains_key(&claim.pool_id()))
+            {
+                return Err(InstallError::DomainInvariant);
+            }
+            previous_promise = Some(id);
+            promises.insert(id, promise);
+        }
+        let mut previous_event_sequence = None;
+        for event in &snapshot.events {
+            if event.sequence() > sequence
+                || previous_event_sequence.is_some_and(|previous| previous > event.sequence())
+            {
+                return Err(InstallError::Sequence);
+            }
+            previous_event_sequence = Some(event.sequence());
+            let valid = match event.data() {
+                EventData::ResourcePool { resource_pool_id } => {
+                    resource_pools.contains_key(resource_pool_id)
+                }
+                EventData::Promise {
+                    promise_id,
+                    version,
+                } => promises
+                    .get(promise_id)
+                    .is_some_and(|promise| *version <= promise.version()),
+                EventData::Deficit {
+                    resource_pool_id,
+                    affected_promise_ids,
+                    ..
+                } => {
+                    resource_pools.contains_key(resource_pool_id)
+                        && affected_promise_ids
+                            .iter()
+                            .all(|id| promises.contains_key(id))
+                }
+            };
+            if !valid {
+                return Err(InstallError::EntityIdentity);
+            }
+        }
+        let mut idempotency_records = BTreeMap::new();
+        let mut previous_identity: Option<(ClientId, IdempotencyKey)> = None;
+        for (client, key, hash, response) in snapshot.idempotency_records {
+            if !response_references_valid(&response, &resource_pools, &promises, sequence) {
+                return Err(InstallError::EntityIdentity);
+            }
+            let identity = (client, key);
+            if previous_identity
+                .as_ref()
+                .is_some_and(|previous| previous >= &identity)
+            {
+                return Err(InstallError::DuplicateIdempotencyIdentity);
+            }
+            previous_identity = Some(identity.clone());
+            idempotency_records.insert(identity, IdempotencyRecord::new(hash, response));
+        }
+        Ok(Self {
+            clock: Box::new(SystemClock),
+            state: EngineState {
+                resource_pools,
+                slack_timelines: BTreeMap::new(),
+                promises,
+                events: snapshot.events,
+                idempotency_records,
+                sequence,
+            },
+            publication_revision: snapshot.publication_revision,
+        })
     }
 
     /// Returns a resource pool by ID.
@@ -430,6 +665,8 @@ impl Engine {
 
     /// Reconstructs every derived slack timeline from authoritative state.
     pub(crate) fn rebuild_slack_timelines(&mut self) -> Result<(), InstallError> {
+        #[cfg(test)]
+        INDEX_REBUILDS.set(INDEX_REBUILDS.get() + 1);
         let active_promises: Vec<&Promise> = self.state.promises.values().collect();
         let mut timelines = BTreeMap::new();
         for (pool_id, pool) in &self.state.resource_pools {

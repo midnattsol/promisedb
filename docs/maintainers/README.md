@@ -27,4 +27,4 @@ Recommended order:
 
 ## Current maturity
 
-PromiseDB is a single-process in-memory state machine. Commands, events, idempotency, capacity revisions, and derived slack indexes exist. WAL, snapshots, recovery, codecs, and replication are not implemented yet. Do not document or rely on them as current behavior.
+PromiseDB is a single-process durable state machine. Commands, events, idempotency, capacity revisions, derived slack indexes, versioned codecs, a locked segmented WAL, effect recovery, atomic snapshots, and post-install compaction exist. Replication and cross-host coordination are not implemented; do not document or rely on them as current behavior.

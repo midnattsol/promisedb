@@ -73,10 +73,13 @@ pub(crate) fn encode_transition_into(
     result
 }
 
-struct Writer<'a>(&'a mut Vec<u8>);
+pub(crate) struct Writer<'a>(&'a mut Vec<u8>);
 
-impl Writer<'_> {
-    fn raw(&mut self, bytes: &[u8]) {
+impl<'a> Writer<'a> {
+    pub(crate) fn new(destination: &'a mut Vec<u8>) -> Self {
+        Self(destination)
+    }
+    pub(crate) fn raw(&mut self, bytes: &[u8]) {
         self.0.extend_from_slice(bytes);
     }
     fn u8(&mut self, value: u8) {
@@ -85,16 +88,16 @@ impl Writer<'_> {
     fn u32(&mut self, value: u32) {
         self.raw(&value.to_le_bytes());
     }
-    fn u64(&mut self, value: u64) {
+    pub(crate) fn u64(&mut self, value: u64) {
         self.raw(&value.to_le_bytes());
     }
-    fn u128(&mut self, value: u128) {
+    pub(crate) fn u128(&mut self, value: u128) {
         self.raw(&value.to_le_bytes());
     }
     fn i64(&mut self, value: i64) {
         self.raw(&value.to_le_bytes());
     }
-    fn len(&mut self, field: &'static str, value: usize) -> Result<(), StorageError> {
+    pub(crate) fn len(&mut self, field: &'static str, value: usize) -> Result<(), StorageError> {
         let value = u32::try_from(value).map_err(|_| StorageError::InvalidLength {
             field,
             length: value as u64,
@@ -107,7 +110,7 @@ impl Writer<'_> {
         self.raw(value);
         Ok(())
     }
-    fn string(&mut self, field: &'static str, value: &str) -> Result<(), StorageError> {
+    pub(crate) fn string(&mut self, field: &'static str, value: &str) -> Result<(), StorageError> {
         self.bytes(field, value.as_bytes())
     }
     fn pool_id(&mut self, id: ResourcePoolId) {
@@ -137,14 +140,14 @@ impl Writer<'_> {
         }
         Ok(())
     }
-    fn resource_pool(&mut self, value: &ResourcePool) -> Result<(), StorageError> {
+    pub(crate) fn resource_pool(&mut self, value: &ResourcePool) -> Result<(), StorageError> {
         self.pool_id(value.id());
         self.string("display name", value.display_name())?;
         self.string("unit name", value.unit().name())?;
         self.u64(value.unit().subunits_per_unit());
         self.curve(value.capacity_curve())
     }
-    fn promise(&mut self, value: &Promise) -> Result<(), StorageError> {
+    pub(crate) fn promise(&mut self, value: &Promise) -> Result<(), StorageError> {
         self.promise_id(value.id());
         match value.state() {
             PromiseState::Held { expires_at } => {
@@ -197,7 +200,7 @@ impl Writer<'_> {
         }
         self.ids("affected promise ids", value.affected_promise_ids())
     }
-    fn response(&mut self, value: &CommandResponse) -> Result<(), StorageError> {
+    pub(crate) fn response(&mut self, value: &CommandResponse) -> Result<(), StorageError> {
         match value {
             Ok(result) => {
                 self.u8(response::SUCCESS);
@@ -339,7 +342,7 @@ impl Writer<'_> {
             DomainError::PublicationRevisionOverflow => domain_error::PUBLICATION_REVISION_OVERFLOW,
         });
     }
-    fn event(&mut self, value: &Event) -> Result<(), StorageError> {
+    pub(crate) fn event(&mut self, value: &Event) -> Result<(), StorageError> {
         self.u64(value.sequence().get());
         self.i64(value.timestamp());
         self.u8(match value.kind() {

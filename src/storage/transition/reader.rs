@@ -91,22 +91,36 @@ pub(crate) fn decode_transition(bytes: &[u8]) -> Result<DurableTransition, Stora
     ))
 }
 
-struct Reader<'a> {
+pub(crate) struct Reader<'a> {
     bytes: &'a [u8],
     offset: usize,
+    max_collection_items: usize,
+    max_string_bytes: usize,
 }
 
 impl<'a> Reader<'a> {
-    fn new(bytes: &'a [u8]) -> Self {
-        Self { bytes, offset: 0 }
+    pub(crate) fn new(bytes: &'a [u8]) -> Self {
+        Self::new_bounded(bytes, usize::MAX, usize::MAX)
     }
-    fn is_empty(&self) -> bool {
+    pub(crate) fn new_bounded(
+        bytes: &'a [u8],
+        max_collection_items: usize,
+        max_string_bytes: usize,
+    ) -> Self {
+        Self {
+            bytes,
+            offset: 0,
+            max_collection_items,
+            max_string_bytes,
+        }
+    }
+    pub(crate) fn is_empty(&self) -> bool {
         self.offset == self.bytes.len()
     }
-    fn safe_capacity(&self, count: usize) -> usize {
+    pub(crate) fn safe_capacity(&self, count: usize) -> usize {
         count.min(self.bytes.len().saturating_sub(self.offset))
     }
-    fn take(&mut self, length: usize) -> Result<&'a [u8], StorageError> {
+    pub(crate) fn take(&mut self, length: usize) -> Result<&'a [u8], StorageError> {
         let end = self
             .offset
             .checked_add(length)
@@ -129,27 +143,41 @@ impl<'a> Reader<'a> {
     fn u32(&mut self) -> Result<u32, StorageError> {
         Ok(u32::from_le_bytes(self.fixed()?))
     }
-    fn u64(&mut self) -> Result<u64, StorageError> {
+    pub(crate) fn u64(&mut self) -> Result<u64, StorageError> {
         Ok(u64::from_le_bytes(self.fixed()?))
     }
-    fn u128(&mut self) -> Result<u128, StorageError> {
+    pub(crate) fn u128(&mut self) -> Result<u128, StorageError> {
         Ok(u128::from_le_bytes(self.fixed()?))
     }
     fn i64(&mut self) -> Result<i64, StorageError> {
         Ok(i64::from_le_bytes(self.fixed()?))
     }
-    fn count(&mut self, field: &'static str) -> Result<usize, StorageError> {
-        usize::try_from(self.u32()?).map_err(|_| StorageError::InvalidLength {
+    pub(crate) fn count(&mut self, field: &'static str) -> Result<usize, StorageError> {
+        let value = usize::try_from(self.u32()?).map_err(|_| StorageError::InvalidLength {
             field,
             length: u64::from(u32::MAX),
-        })
+        })?;
+        if value > self.max_collection_items {
+            return Err(StorageError::InvalidLength {
+                field,
+                length: value as u64,
+            });
+        }
+        Ok(value)
     }
     fn bytes(&mut self, field: &'static str) -> Result<&'a [u8], StorageError> {
         let length = self.count(field)?;
         self.take(length)
     }
-    fn string(&mut self, field: &'static str) -> Result<String, StorageError> {
-        String::from_utf8(self.bytes(field)?.to_vec()).map_err(|_| StorageError::InvalidUtf8)
+    pub(crate) fn string(&mut self, field: &'static str) -> Result<String, StorageError> {
+        let length = self.count(field)?;
+        if length > self.max_string_bytes {
+            return Err(StorageError::InvalidLength {
+                field,
+                length: length as u64,
+            });
+        }
+        String::from_utf8(self.take(length)?.to_vec()).map_err(|_| StorageError::InvalidUtf8)
     }
     fn pool_id(&mut self) -> Result<ResourcePoolId, StorageError> {
         Ok(ResourcePoolId::from_bytes(self.fixed()?))
@@ -182,14 +210,14 @@ impl<'a> Reader<'a> {
         }
         Ok(Bundle::new(values)?)
     }
-    fn resource_pool(&mut self) -> Result<ResourcePool, StorageError> {
+    pub(crate) fn resource_pool(&mut self) -> Result<ResourcePool, StorageError> {
         let id = self.pool_id()?;
         let display_name = self.string("display name")?;
         let unit = Unit::new(self.string("unit name")?, self.u64()?)?;
         let curve = self.curve()?;
         Ok(ResourcePool::with_id(id, display_name, unit, curve))
     }
-    fn promise(&mut self) -> Result<Promise, StorageError> {
+    pub(crate) fn promise(&mut self) -> Result<Promise, StorageError> {
         let id = self.promise_id()?;
         let state = match self.u8()? {
             promise_state::HELD => PromiseState::Held {
@@ -272,7 +300,7 @@ impl<'a> Reader<'a> {
                 "invalid capacity revision outcome",
             ))
     }
-    fn response(&mut self) -> Result<CommandResponse, StorageError> {
+    pub(crate) fn response(&mut self) -> Result<CommandResponse, StorageError> {
         match self.u8()? {
             response::SUCCESS => Ok(Ok(self.result()?)),
             response::DOMAIN_ERROR => Ok(Err(self.domain_error()?)),
@@ -443,7 +471,7 @@ impl<'a> Reader<'a> {
             }
         })
     }
-    fn event(&mut self) -> Result<Event, StorageError> {
+    pub(crate) fn event(&mut self) -> Result<Event, StorageError> {
         let sequence = self.sequence()?;
         let timestamp = self.i64()?;
         let kind = match self.u8()? {

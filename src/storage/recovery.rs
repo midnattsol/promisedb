@@ -206,6 +206,14 @@ impl EngineRecovery {
         }
     }
 
+    /// Starts recovery from a snapshot at WAL sequence `u64::MAX`.
+    pub(crate) fn from_exhausted_snapshot(engine: Engine) -> Self {
+        Self {
+            engine,
+            next_record_sequence: None,
+        }
+    }
+
     /// Returns the next global record sequence expected from a feed.
     pub fn next_record_sequence(&self) -> Option<RecordSequence> {
         self.next_record_sequence

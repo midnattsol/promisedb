@@ -86,15 +86,18 @@ The database directory is:
 database/
 ├── LOCK
 ├── MANIFEST
+├── snapshots/
+│   └── 00000000000000000042.snapshot
 └── wal/
-    ├── 00000000000000000001.wal
-    ├── 00000000000000000042.wal
+    ├── 00000000000000000043.wal
     └── ...
 ```
 
-### Manifest version 1
+### Manifest version 2
 
-`MANIFEST` is exactly 64 canonical bytes:
+`MANIFEST` is exactly 96 canonical bytes. New databases write version 2; version 1 is intentionally rejected because no release compatibility is promised. In addition to the database UUID, record limit, and centralized state-machine semantics version, it persists the snapshot total-byte, top-level collection, string-byte, and nested-collection limits. Opening requires an exact requested match. Bytes `64..96` are the full BLAKE3 checksum over bytes `0..64`; unused bytes are zero.
+
+The former version-1 layout was:
 
 | Byte range | Field |
 | --- | --- |
@@ -131,4 +134,14 @@ Opening requires canonical names, strictly ordered segment starts, matching mani
 
 `SegmentedWal` validates each complete append group and uses checked conversion and `u64` arithmetic for physical-length projection before any I/O. An unrepresentable segment length returns structured `StorageError::SegmentLengthOverflow` without writing or rotating. It rotates before append when a nonempty active segment plus the group would cross `segment_target`. The whole group enters one segment and remains one `WalBackend::append`; an oversized group is allowed on a fresh segment. The default target is 256 MiB and the minimum is one segment header plus one minimum record (112 bytes). The target is operational rather than persisted. `Sync` synchronizes the active file and is the default. `Flush` only flushes userspace state and is not crash durable.
 
-Snapshots, compaction/segment deletion, asynchronous I/O, and cross-host lock coordination are not implemented.
+## Snapshot format version 1 and compaction
+
+Snapshots use canonical 20-digit WAL-watermark filenames ending in `.snapshot`; watermark zero represents an empty WAL. The fixed 128-byte header stores `PDBN`, version/flags/lengths, total and payload lengths, database UUID, state-machine semantics version, last represented WAL record sequence, independent domain sequence, `u128` publication revision, and `events_pruned_through` (currently required to be zero). Reserved bytes must be zero. A full 32-byte BLAKE3 digest over `header || payload` is the trailer.
+
+The payload retains every resource pool, every promise including terminal promises, all retained events in exact order, and every idempotency identity, command hash, and exact response. Maps encode in key order. `SlackTimeline` and clocks are excluded; indexes rebuild once after snapshot validation and WAL suffix replay. Decoding enforces persisted total, top-level collection, string, and nested collection budgets before relevant allocation and validates ordering, uniqueness, entity/history references, and sequence bounds.
+
+`create_snapshot` rejects poisoned coordinators. It first establishes and synchronizes an empty active segment at `watermark + 1` when a successor exists, captures state, then installs `snapshots/SNAPSHOT.tmp` by create-new, write, file sync, rename, and directory sync. Only after installation does it remove fully covered non-active segments and older snapshots, synchronizing each directory. A post-install cleanup failure is reported as committed cleanup with the installed path and watermark.
+
+Open removes only the recognized snapshot temp, selects the highest canonical snapshot, and never falls back if that snapshot is corrupt. After complete UUID/semantics/checksum/header validation, obsolete lower WAL prefixes may be ignored; the required suffix must begin exactly at `watermark + 1`. Suffix records stream through `EngineRecovery`, preserving final-tail repair rules and exact append continuation. Snapshot creation and recovery are linear in retained authoritative state plus suffix size; retained terminal promises, events, and idempotency records make snapshot size linear in retention. Event pruning is not yet implemented, so `events_pruned_through` remains zero.
+
+Asynchronous I/O and cross-host lock coordination are not implemented.
