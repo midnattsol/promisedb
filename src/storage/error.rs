@@ -96,6 +96,8 @@ pub enum StorageError {
     /// This compatibility name remains for the command codec while the payload-to-record
     /// transition is pending. WAL record versions use [`Self::UnsupportedRecordVersion`].
     UnsupportedVersion(u8),
+    /// A durable-transition payload uses an unsupported format version.
+    UnsupportedTransitionVersion(u8),
     /// A WAL record uses a framing version this crate does not understand.
     UnsupportedRecordVersion {
         /// Byte offset at which the record starts.
@@ -163,6 +165,9 @@ impl Display for StorageError {
             Self::Io { kind, message } => write!(formatter, "I/O error ({kind:?}): {message}"),
             Self::UnsupportedVersion(version) => {
                 write!(formatter, "unsupported command format version {version}")
+            }
+            Self::UnsupportedTransitionVersion(version) => {
+                write!(formatter, "unsupported transition format version {version}")
             }
             Self::UnsupportedRecordVersion { offset, version } => write!(
                 formatter,

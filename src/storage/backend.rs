@@ -33,9 +33,22 @@ impl MemoryWal {
         Self::default()
     }
 
+    /// Creates an in-memory WAL initialized with previously persisted bytes.
+    pub fn from_bytes(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            ..Self::default()
+        }
+    }
+
     /// Returns all bytes appended so far.
     pub fn bytes(&self) -> &[u8] {
         &self.bytes
+    }
+
+    /// Consumes the backend and returns all retained WAL bytes.
+    pub fn into_bytes(self) -> Vec<u8> {
+        self.bytes
     }
 
     /// Returns the number of append calls.

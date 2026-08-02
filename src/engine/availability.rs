@@ -17,6 +17,29 @@ pub struct AvailabilityConflict {
 }
 
 impl AvailabilityConflict {
+    pub(crate) fn restore(
+        resource_pool_id: ResourcePoolId,
+        blocking_interval: Interval,
+        required_quantity: Quantity,
+        available_quantity: Quantity,
+        deficit_quantity: Quantity,
+        conflicting_promise_ids: Vec<PromiseId>,
+    ) -> Option<Self> {
+        (required_quantity > available_quantity
+            && required_quantity - available_quantity == deficit_quantity
+            && conflicting_promise_ids
+                .windows(2)
+                .all(|ids| ids[0] < ids[1]))
+        .then_some(Self {
+            resource_pool_id,
+            blocking_interval,
+            required_quantity,
+            available_quantity,
+            deficit_quantity,
+            conflicting_promise_ids,
+        })
+    }
+
     /// Returns the resource pool whose slack is insufficient.
     pub fn resource_pool_id(&self) -> ResourcePoolId {
         self.resource_pool_id
@@ -109,6 +132,16 @@ pub struct ChoiceConflict {
 }
 
 impl ChoiceConflict {
+    pub(crate) fn restore(
+        alternative_index: usize,
+        conflicts: Vec<AvailabilityConflict>,
+    ) -> Option<Self> {
+        (!conflicts.is_empty()).then_some(Self {
+            alternative_index,
+            conflicts,
+        })
+    }
+
     /// Returns the zero-based position of the unavailable alternative.
     pub fn alternative_index(&self) -> usize {
         self.alternative_index

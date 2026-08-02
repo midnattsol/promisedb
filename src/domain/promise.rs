@@ -132,6 +132,29 @@ pub struct Promise {
 }
 
 impl Promise {
+    /// Restores a validated authoritative promise from durable after-values.
+    pub(crate) fn restore(
+        id: PromiseId,
+        state: PromiseState,
+        bundle: Bundle,
+        version: Version,
+        created_sequence: SequenceNumber,
+        updated_sequence: SequenceNumber,
+    ) -> Result<Self, DomainError> {
+        if created_sequence.get() == 0 || updated_sequence < created_sequence || version.get() == 0
+        {
+            return Err(DomainError::InvalidPromiseHistory);
+        }
+        Ok(Self {
+            id,
+            state,
+            bundle,
+            version,
+            created_sequence,
+            updated_sequence,
+        })
+    }
+
     /// Creates a held promise using an identity prepared before state-machine entry.
     ///
     /// # Errors

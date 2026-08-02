@@ -13,7 +13,7 @@ Every command is identified by `(ClientId, IdempotencyKey)`. PromiseDB hashes th
 
 Canonical hashing uses a versioned domain prefix, explicit one-byte tags, little-endian fixed-width integers, length-prefixed UTF-8 strings and collections, stable UUID bytes, and normalized capacity curves. Bundle claims are sorted by resource-pool ID, interval start, interval end, and quantity before hashing, so input claim order is not semantically significant.
 
-An exact retry returns the cached response before inspecting the supplied timestamp or current state. Reusing the identity with another operation returns `IdempotencyConflict`. Both successful and error responses are cached. Idempotency records are authoritative recovery state and must be included in snapshots or reconstructed by WAL replay.
+An exact retry returns the cached response before inspecting the supplied timestamp or current state. Reusing the identity with another operation returns `IdempotencyConflict`. Both successful and error responses are cached. Idempotency records are authoritative recovery state and must be included in snapshots or restored from persisted prepared transitions without replaying commands.
 
 ## Consequences
 

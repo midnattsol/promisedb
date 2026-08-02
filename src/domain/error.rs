@@ -60,6 +60,10 @@ pub enum DomainError {
     VersionOverflow,
     /// The global sequence number cannot be incremented without overflowing.
     SequenceOverflow,
+    /// The runtime publication revision cannot be incremented.
+    PublicationRevisionOverflow,
+    /// Restored promise versions or sequence history are structurally inconsistent.
+    InvalidPromiseHistory,
     /// The system clock cannot be represented as a PromiseDB timestamp.
     SystemTimeOutOfRange,
     /// A held promise has reached its expiration deadline.
@@ -104,6 +108,8 @@ impl Display for DomainError {
             Self::VersionConflict => "expected promise version does not match the current version",
             Self::VersionOverflow => "promise version cannot be incremented",
             Self::SequenceOverflow => "global sequence number cannot be incremented",
+            Self::PublicationRevisionOverflow => "publication revision cannot be incremented",
+            Self::InvalidPromiseHistory => "restored promise history is inconsistent",
             Self::SystemTimeOutOfRange => {
                 "system clock cannot be represented as a PromiseDB timestamp"
             }

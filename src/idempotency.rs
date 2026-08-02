@@ -230,6 +230,11 @@ impl CanonicalHash for ReplacementState {
 pub struct CommandHash([u8; 32]);
 
 impl CommandHash {
+    /// Restores a digest persisted with a durable transition.
+    pub(crate) fn from_bytes(bytes: [u8; 32]) -> Self {
+        Self(bytes)
+    }
+
     /// Returns the 32-byte digest.
     pub fn as_bytes(&self) -> &[u8; 32] {
         &self.0

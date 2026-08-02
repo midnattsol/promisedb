@@ -110,7 +110,9 @@ The pair `(ClientId, IdempotencyKey)` identifies one command. PromiseDB hashes t
 
 Both successful and error responses are cached. Idempotency keys are scoped by client, so different clients may use the same key independently. Bundle claim order is not significant for command identity; claims are sorted canonically before hashing. Relative-bundle claim order is likewise insignificant and is sorted by pool ID, start offset, end offset, and quantity. `HoldFirstSlot` identity includes its prepared promise ID, relative bundle, earliest and latest starts, step, and deadline. Choice alternative order is significant and is preserved in the canonical representation, while each alternative bundle still uses canonical claim ordering.
 
-A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
+A command describes the requested mutation, a `CommandResult` describes its immediate business outcome, and events describe successful state changes. A timestamped durable item records the exact response, authoritative after-values, newly emitted events, WAL timestamp, and final sequence. Expiration events are emitted before the requested-operation event. Capacity revision and deficit audit events may share the revision's single transition sequence.
+
+`Database::apply_batch` evaluates commands in input order against one candidate. Exact retries and conflicts contribute responses but no WAL item. Every first-seen command contributes one timestamped item, including unavailable and error responses. Version 1 may repeat cumulative authoritative after-values from earlier commands in the same group; newly emitted events and idempotency identity are never cumulative.
 
 Queries are pure and do not process hold deadlines. Callers requiring an up-to-date deadline boundary must apply `ProcessExpirations` or another mutating command first.
 
@@ -118,7 +120,9 @@ Queries are pure and do not process hold deadlines. Callers requiring an up-to-d
 
 Each promise has a local version beginning at one. Every successful promise transition increments it. Mutations receive an expected version and reject stale requests with `VersionConflict`.
 
-The engine also maintains one global monotonic `SequenceNumber`. Each successful durable transition receives exactly one sequence. A rejected command does not consume a sequence, although expirations processed before it do.
+The engine maintains one global monotonic domain `SequenceNumber`. Each successful domain mutation receives exactly one sequence. A rejected or unavailable requested operation does not consume its own sequence, although expirations processed before it do.
+
+Publication revision is separate. Every published first-seen command advances it once even when the command only creates an idempotency record or returns an error/unavailable outcome. Exact retries and idempotency conflicts publish nothing and advance neither counter. Revision arithmetic is checked: first-seen direct application returns `PublicationRevisionOverflow`, durable preparation returns `PreparationError::RevisionOverflow`, and recovery installation returns `InstallError::PublicationRevision` before state mutation.
 
 ## Release
 
@@ -140,6 +144,8 @@ Insufficient capacity returns `ReplaceOutcome::Unavailable { conflicts }`. It do
 
 ## Determinism
 
-Domain transitions receive `now` explicitly. Public engine operations obtain it from an injected clock. Replay and future replication must reuse the timestamp selected for the original command.
+Domain transitions receive `now` explicitly. Public engine operations obtain it from an injected clock. Direct `Engine::apply` executes against published state without cloning complete `EngineState`; durable preparation executes deterministic admission once against isolated candidate state.
 
-Canonical representations use chronological ordering and do not depend on hash-map iteration, memory addresses, internal clocks, or unseeded randomness.
+Recovery and future replication install versioned durable effects; they never replay command admission. Recovery also requires every emitted event timestamp to match its enclosing WAL record, and rebuilds derived indexes once after all effects are installed. The embedded original command and timestamp remain audit inputs, not recovery instructions. Canonical representations use chronological ordering and do not depend on hash-map iteration, memory addresses, internal clocks, or unseeded randomness.
+
+Any append, flush, or sync failure makes the write outcome indeterminate. `Database` leaves the candidate unpublished, poisons further writes, and continues to permit immutable reads. Restart and recovery determine which complete records became durable.

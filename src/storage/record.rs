@@ -148,63 +148,158 @@ impl Record {
     }
 }
 
+/// Restricted append-only destination supplied to a record payload encoder.
+///
+/// The framing layer retains ownership of header bytes and any destination prefix, so
+/// payload writers cannot truncate or overwrite them.
+pub struct RecordPayloadWriter<'a> {
+    destination: &'a mut Vec<u8>,
+}
+
+impl RecordPayloadWriter<'_> {
+    /// Appends one byte to the current payload.
+    pub fn write_byte(&mut self, value: u8) {
+        self.destination.push(value);
+    }
+
+    /// Appends bytes to the current payload.
+    pub fn write_bytes(&mut self, value: &[u8]) {
+        self.destination.extend_from_slice(value);
+    }
+
+    pub(crate) fn destination_mut(&mut self) -> &mut Vec<u8> {
+        self.destination
+    }
+}
+
 /// Encodes one record using format version 1.
 ///
-/// The checksum is the first 16 bytes of BLAKE3 over the contiguous header, payload,
-/// and zero padding. The checksum itself is excluded.
+/// This compatibility wrapper delegates to [`encode_into`] and returns exactly the
+/// existing standalone golden bytes.
 ///
 /// # Errors
 ///
 /// Returns an error if the payload cannot be represented by the format or the total
 /// record length exceeds `limits`.
 pub fn encode(record: &Record, limits: RecordLimits) -> Result<Vec<u8>, StorageError> {
-    let payload_len =
-        u32::try_from(record.payload.len()).map_err(|_| StorageError::InvalidLength {
-            field: "record payload",
-            length: u64::try_from(record.payload.len()).unwrap_or(u64::MAX),
-        })?;
-    let padding_len = padding_len(payload_len);
-    let record_len = MIN_RECORD_LEN
-        .checked_add(payload_len)
-        .and_then(|length| length.checked_add(padding_len as u32))
-        .filter(|length| *length <= FORMAT_MAX_RECORD_LEN)
-        .ok_or(StorageError::InvalidLength {
-            field: "WAL record",
-            length: u64::from(payload_len) + u64::from(MIN_RECORD_LEN),
-        })?;
-    if record_len > limits.max_record_len {
-        return Err(StorageError::RecordTooLarge {
-            offset: 0,
-            length: u64::from(record_len),
-            max: limits.max_record_len,
-        });
-    }
-
-    let capacity = usize::try_from(record_len).map_err(|_| StorageError::InvalidLength {
-        field: "WAL record",
-        length: u64::from(record_len),
-    })?;
     let mut encoded = Vec::new();
-    encoded
-        .try_reserve_exact(capacity)
-        .map_err(|_| StorageError::InvalidLength {
-            field: "WAL record allocation",
-            length: u64::from(record_len),
-        })?;
-    encoded.extend_from_slice(&MAGIC);
-    encoded.push(FORMAT_VERSION);
-    encoded.push(FORMAT_FLAGS);
-    encoded.extend_from_slice(&(HEADER_LEN as u16).to_le_bytes());
-    encoded.extend_from_slice(&record_len.to_le_bytes());
-    encoded.extend_from_slice(&payload_len.to_le_bytes());
-    encoded.extend_from_slice(&record.record_sequence.get().to_le_bytes());
-    encoded.extend_from_slice(&record.timestamp.to_le_bytes());
-    encoded.extend_from_slice(&record.payload);
-    encoded.resize(encoded.len() + padding_len, 0);
-    let checksum = blake3::hash(&encoded);
-    encoded.extend_from_slice(&checksum.as_bytes()[..CHECKSUM_LEN]);
-    debug_assert_eq!(encoded.len(), capacity);
+    encode_into(record, limits, &mut encoded)?;
     Ok(encoded)
+}
+
+/// Appends an encoded record to `destination`, preserving any existing prefix.
+///
+/// # Errors
+///
+/// Returns an error if framing fails. On error, `destination` is truncated back to its
+/// original length.
+pub fn encode_into(
+    record: &Record,
+    limits: RecordLimits,
+    destination: &mut Vec<u8>,
+) -> Result<(), StorageError> {
+    encode_payload_into(
+        record.record_sequence,
+        record.timestamp,
+        limits,
+        destination,
+        |payload| {
+            payload.write_bytes(&record.payload);
+            Ok(())
+        },
+    )
+}
+
+/// Frames a fallibly generated payload directly into an existing destination.
+///
+/// The function reserves and backpatches the 32-byte header, enforces all version-1
+/// size limits, adds zero padding, checksums the contiguous record prefix, and appends
+/// the checksum. The payload writer has append-only access to payload bytes.
+///
+/// # Errors
+///
+/// Returns payload-writer, allocation, representation, or record-limit errors. Every
+/// returned error truncates `destination` to its original length.
+pub fn encode_payload_into<F>(
+    record_sequence: RecordSequence,
+    timestamp: Timestamp,
+    limits: RecordLimits,
+    destination: &mut Vec<u8>,
+    write_payload: F,
+) -> Result<(), StorageError>
+where
+    F: FnOnce(&mut RecordPayloadWriter<'_>) -> Result<(), StorageError>,
+{
+    let record_start = destination.len();
+    let result = (|| {
+        destination
+            .try_reserve(HEADER_LEN)
+            .map_err(|_| StorageError::InvalidLength {
+                field: "WAL record allocation",
+                length: HEADER_LEN as u64,
+            })?;
+        destination.resize(record_start + HEADER_LEN, 0);
+        {
+            let mut payload = RecordPayloadWriter { destination };
+            write_payload(&mut payload)?;
+        }
+
+        let payload_length = destination
+            .len()
+            .checked_sub(record_start + HEADER_LEN)
+            .ok_or(StorageError::InvalidLength {
+                field: "record payload",
+                length: u64::MAX,
+            })?;
+        let payload_len =
+            u32::try_from(payload_length).map_err(|_| StorageError::InvalidLength {
+                field: "record payload",
+                length: u64::try_from(payload_length).unwrap_or(u64::MAX),
+            })?;
+        let padding_len = padding_len(payload_len);
+        let record_len = MIN_RECORD_LEN
+            .checked_add(payload_len)
+            .and_then(|length| length.checked_add(padding_len as u32))
+            .filter(|length| *length <= FORMAT_MAX_RECORD_LEN)
+            .ok_or(StorageError::InvalidLength {
+                field: "WAL record",
+                length: u64::from(payload_len) + u64::from(MIN_RECORD_LEN),
+            })?;
+        if record_len > limits.max_record_len {
+            return Err(StorageError::RecordTooLarge {
+                offset: 0,
+                length: u64::from(record_len),
+                max: limits.max_record_len,
+            });
+        }
+
+        destination
+            .try_reserve(padding_len + CHECKSUM_LEN)
+            .map_err(|_| StorageError::InvalidLength {
+                field: "WAL record allocation",
+                length: u64::from(record_len),
+            })?;
+        destination.resize(destination.len() + padding_len, 0);
+
+        let header = &mut destination[record_start..record_start + HEADER_LEN];
+        header[MAGIC_RANGE].copy_from_slice(&MAGIC);
+        header[FORMAT_VERSION_OFFSET] = FORMAT_VERSION;
+        header[FLAGS_OFFSET] = FORMAT_FLAGS;
+        header[HEADER_LENGTH_RANGE].copy_from_slice(&(HEADER_LEN as u16).to_le_bytes());
+        header[RECORD_LENGTH_RANGE].copy_from_slice(&record_len.to_le_bytes());
+        header[PAYLOAD_LENGTH_RANGE].copy_from_slice(&payload_len.to_le_bytes());
+        header[RECORD_SEQUENCE_RANGE].copy_from_slice(&record_sequence.get().to_le_bytes());
+        header[TIMESTAMP_RANGE].copy_from_slice(&timestamp.to_le_bytes());
+
+        let checksum = blake3::hash(&destination[record_start..]);
+        destination.extend_from_slice(&checksum.as_bytes()[..CHECKSUM_LEN]);
+        debug_assert_eq!(destination.len() - record_start, record_len as usize);
+        Ok(())
+    })();
+    if result.is_err() {
+        destination.truncate(record_start);
+    }
+    result
 }
 
 /// A bounded, non-resynchronizing reader for a sequence of WAL records.
@@ -497,6 +592,58 @@ mod tests {
                 0xba, 0xd8,
             ]
         );
+    }
+
+    #[test]
+    fn append_framing_preserves_prefix_and_matches_standalone_bytes() {
+        let record = record(1, &[0xaa, 0xbb, 0xcc]);
+        let expected = encode(&record, RecordLimits::default()).unwrap();
+        let mut destination = vec![0x11, 0x22, 0x33];
+        encode_into(&record, RecordLimits::default(), &mut destination).unwrap();
+        assert_eq!(&destination[..3], &[0x11, 0x22, 0x33]);
+        assert_eq!(&destination[3..], expected);
+    }
+
+    #[test]
+    fn append_framing_rolls_back_payload_and_limit_errors() {
+        let prefix = vec![0x11, 0x22, 0x33];
+        let mut destination = prefix.clone();
+        let error = encode_payload_into(
+            RecordSequence::FIRST,
+            0,
+            RecordLimits::default(),
+            &mut destination,
+            |payload| {
+                payload.write_bytes(b"partial payload");
+                Err(StorageError::CorruptRecord("injected payload failure"))
+            },
+        );
+        assert_eq!(
+            error,
+            Err(StorageError::CorruptRecord("injected payload failure"))
+        );
+        assert_eq!(destination, prefix);
+
+        let mut destination = prefix.clone();
+        let error = encode_payload_into(
+            RecordSequence::FIRST,
+            0,
+            RecordLimits::new(MIN_RECORD_LEN).unwrap(),
+            &mut destination,
+            |payload| {
+                payload.write_byte(1);
+                Ok(())
+            },
+        );
+        assert_eq!(
+            error,
+            Err(StorageError::RecordTooLarge {
+                offset: 0,
+                length: 56,
+                max: MIN_RECORD_LEN,
+            })
+        );
+        assert_eq!(destination, prefix);
     }
 
     #[test]

@@ -21,6 +21,22 @@ pub struct CapacityDeficit {
 }
 
 impl CapacityDeficit {
+    pub(crate) fn restore(
+        resource_pool_id: ResourcePoolId,
+        interval: Interval,
+        quantity: Quantity,
+        affected_promise_ids: Vec<PromiseId>,
+    ) -> Option<Self> {
+        (quantity > 0 && affected_promise_ids.windows(2).all(|ids| ids[0] < ids[1])).then_some(
+            Self {
+                resource_pool_id,
+                interval,
+                quantity,
+                affected_promise_ids,
+            },
+        )
+    }
+
     /// Returns the resource pool in deficit.
     pub fn resource_pool_id(&self) -> ResourcePoolId {
         self.resource_pool_id
@@ -51,6 +67,19 @@ pub struct CapacityRevisionOutcome {
 }
 
 impl CapacityRevisionOutcome {
+    pub(crate) fn restore(
+        sequence: SequenceNumber,
+        deficits: Vec<CapacityDeficit>,
+        affected_promise_ids: Vec<PromiseId>,
+    ) -> Option<Self> {
+        (sequence.get() > 0 && affected_promise_ids.windows(2).all(|ids| ids[0] < ids[1]))
+            .then_some(Self {
+                sequence,
+                deficits,
+                affected_promise_ids,
+            })
+    }
+
     /// Returns the sequence assigned to the applied revision.
     pub fn sequence(&self) -> SequenceNumber {
         self.sequence

@@ -11,13 +11,13 @@ Replay and future replicated nodes must apply identical inputs. Generating resou
 
 A control API prepares internal commands before state-machine entry. It generates `ResourcePoolId` and `PromiseId`, resolves any external names, and supplies a `(ClientId, IdempotencyKey)` pair. The resulting `Command` contains a deterministic `CommandOperation` and is applied through `Engine::apply(command, now)`.
 
-The authoritative timestamp is supplied separately from the command. Future replication or replay must reuse the timestamp chosen for the original application.
+The authoritative timestamp is supplied separately from the command. Live application and command-based consensus must use the leader-selected timestamp.
 
-Commands are intended to become the WAL recovery input. Events are ordered audit facts derived from successful transitions, not the sole recovery source. Queries are pure current-state reads; deadline processing is an explicit command or occurs before another mutating command.
+ADR-0010 supersedes the original command-replay storage decision: commands are audit data inside prepared durable transitions, and recovery installs effects without executing commands. Events remain ordered audit facts, not the sole recovery source. Queries are pure current-state reads; deadline processing is an explicit command or occurs before another mutating command.
 
 ## Consequences
 
-- Replicas and replay preserve exactly the same entity identities.
+- Replicas and recovered effects preserve exactly the same entity identities.
 - The engine command path uses no randomness or system clock.
 - Control-plane deployment can later move outside the database process without changing command semantics.
 - Idempotency identity is present on every command; storage and duplicate detection remain a separate implementation step.
@@ -28,5 +28,5 @@ Commands are intended to become the WAL recovery input. Events are ordered audit
 
 - Generating IDs independently in each state-machine replica: rejected because it is nondeterministic.
 - Letting external clients choose all internal IDs directly: rejected as the only interface because the control API should own identity preparation.
-- Persisting only derived events: rejected because commands preserve the requested deterministic transition more directly for replay.
+- Persisting only derived events: rejected because events omit complete authoritative after-values and exact responses.
 - Processing expirations inside read queries: rejected because reads should not mutate authoritative state.

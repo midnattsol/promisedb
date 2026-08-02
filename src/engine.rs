@@ -6,6 +6,8 @@
 
 mod availability;
 mod capacity_revision;
+#[cfg(test)]
+mod prepared_transition_tests;
 
 pub use availability::{
     AvailabilityConflict, ChoiceConflict, ChoiceOutcome, HoldOutcome, ReplaceOutcome, Slot,
@@ -24,7 +26,7 @@ use crate::domain::{
     Unit, Version,
 };
 use crate::event::{Event, EventData, EventKind};
-use crate::idempotency::{IdempotencyRecord, hash_operation};
+use crate::idempotency::{CommandHash, CommandResponse, IdempotencyRecord, hash_operation};
 use crate::index::{Slack, SlackTimeline};
 use std::collections::BTreeMap;
 
@@ -67,12 +69,184 @@ struct SlotRange {
 /// promises when availability is evaluated.
 pub struct Engine {
     clock: Box<dyn Clock>,
+    state: EngineState,
+    publication_revision: PublicationRevision,
+}
+
+/// Authoritative and derived engine state, separated from the non-cloneable clock.
+#[derive(Debug, PartialEq, Eq)]
+struct EngineState {
     resource_pools: BTreeMap<ResourcePoolId, ResourcePool>,
     slack_timelines: BTreeMap<ResourcePoolId, SlackTimeline>,
     promises: BTreeMap<PromiseId, Promise>,
     events: Vec<Event>,
     idempotency_records: BTreeMap<(ClientId, IdempotencyKey), IdempotencyRecord>,
     sequence: SequenceNumber,
+}
+
+impl Clone for EngineState {
+    fn clone(&self) -> Self {
+        #[cfg(test)]
+        ENGINE_STATE_CLONES.with(|count| count.set(count.get() + 1));
+        Self {
+            resource_pools: self.resource_pools.clone(),
+            slack_timelines: self.slack_timelines.clone(),
+            promises: self.promises.clone(),
+            events: self.events.clone(),
+            idempotency_records: self.idempotency_records.clone(),
+            sequence: self.sequence,
+        }
+    }
+}
+
+#[cfg(test)]
+thread_local! {
+    static ENGINE_STATE_CLONES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+impl EngineState {
+    fn empty() -> Self {
+        Self {
+            resource_pools: BTreeMap::new(),
+            slack_timelines: BTreeMap::new(),
+            promises: BTreeMap::new(),
+            events: Vec::new(),
+            idempotency_records: BTreeMap::new(),
+            sequence: SequenceNumber::new(0),
+        }
+    }
+}
+
+/// Monotonic publication generation, independent of the domain event sequence.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub(crate) struct PublicationRevision(u128);
+
+/// A durable, codec-stable description of one first-seen command's effects.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct DurableTransition {
+    command: Command,
+    client_id: ClientId,
+    idempotency_key: IdempotencyKey,
+    command_hash: CommandHash,
+    response: CommandResponse,
+    resource_pools: Vec<ResourcePool>,
+    promises: Vec<Promise>,
+    events: Vec<Event>,
+    final_sequence: SequenceNumber,
+}
+
+/// One durable transition paired with its authoritative record timestamp.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct TimestampedTransition {
+    timestamp: Timestamp,
+    transition: DurableTransition,
+}
+
+/// One ordered group-commit candidate prepared from a single state clone.
+pub(crate) struct PreparedBatch {
+    base_revision: PublicationRevision,
+    next_revision: PublicationRevision,
+    candidate: Option<EngineState>,
+    responses: Vec<CommandResponse>,
+    durable_items: Vec<TimestampedTransition>,
+}
+
+/// Publication failures that must be detected before persistence.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum PreparationError {
+    StaleRevision {
+        expected: PublicationRevision,
+        actual: PublicationRevision,
+    },
+    RevisionOverflow,
+}
+
+/// Validation failures while installing durable effects during recovery.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum InstallError {
+    CommandIdentity,
+    CommandHash,
+    DuplicateIdempotencyIdentity,
+    Sequence,
+    EntityIdentity,
+    DomainInvariant,
+    PublicationRevision,
+    Index(DomainError),
+}
+
+impl TimestampedTransition {
+    pub(crate) fn timestamp(&self) -> Timestamp {
+        self.timestamp
+    }
+
+    pub(crate) fn transition(&self) -> &DurableTransition {
+        &self.transition
+    }
+}
+
+impl PreparedBatch {
+    pub(crate) fn durable_items(&self) -> &[TimestampedTransition] {
+        &self.durable_items
+    }
+
+    pub(crate) fn into_responses(self) -> Vec<CommandResponse> {
+        self.responses
+    }
+}
+
+impl DurableTransition {
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn restore(
+        command: Command,
+        client_id: ClientId,
+        idempotency_key: IdempotencyKey,
+        command_hash: CommandHash,
+        response: CommandResponse,
+        resource_pools: Vec<ResourcePool>,
+        promises: Vec<Promise>,
+        events: Vec<Event>,
+        final_sequence: SequenceNumber,
+    ) -> Self {
+        Self {
+            command,
+            client_id,
+            idempotency_key,
+            command_hash,
+            response,
+            resource_pools,
+            promises,
+            events,
+            final_sequence,
+        }
+    }
+
+    pub(crate) fn command(&self) -> &Command {
+        &self.command
+    }
+    pub(crate) fn client_id(&self) -> &ClientId {
+        &self.client_id
+    }
+    pub(crate) fn idempotency_key(&self) -> &IdempotencyKey {
+        &self.idempotency_key
+    }
+    pub(crate) fn command_hash(&self) -> CommandHash {
+        self.command_hash
+    }
+    pub(crate) fn response(&self) -> &CommandResponse {
+        &self.response
+    }
+    pub(crate) fn resource_pools(&self) -> &[ResourcePool] {
+        &self.resource_pools
+    }
+    pub(crate) fn promises(&self) -> &[Promise] {
+        &self.promises
+    }
+    pub(crate) fn events(&self) -> &[Event] {
+        &self.events
+    }
+    pub(crate) fn final_sequence(&self) -> SequenceNumber {
+        self.final_sequence
+    }
 }
 
 impl Engine {
@@ -88,40 +262,36 @@ impl Engine {
     pub fn with_clock(clock: impl Clock + 'static) -> Self {
         Self {
             clock: Box::new(clock),
-            resource_pools: BTreeMap::new(),
-            slack_timelines: BTreeMap::new(),
-            promises: BTreeMap::new(),
-            events: Vec::new(),
-            idempotency_records: BTreeMap::new(),
-            sequence: SequenceNumber::new(0),
+            state: EngineState::empty(),
+            publication_revision: PublicationRevision::default(),
         }
     }
 
     /// Returns a resource pool by ID.
     pub fn resource_pool(&self, id: ResourcePoolId) -> Option<&ResourcePool> {
-        self.resource_pools.get(&id)
+        self.state.resource_pools.get(&id)
     }
     /// Returns the derived slack timeline for a resource pool by ID.
     ///
     /// The timeline is an acceleration index reconstructed from the pool's
     /// capacity curve and active promises; it is not authoritative state.
     pub fn slack_timeline(&self, id: ResourcePoolId) -> Option<&SlackTimeline> {
-        self.slack_timelines.get(&id)
+        self.state.slack_timelines.get(&id)
     }
 
     /// Returns the latest sequence committed by the engine.
     pub fn sequence(&self) -> SequenceNumber {
-        self.sequence
+        self.state.sequence
     }
 
     /// Returns a promise by ID.
     pub fn promise(&self, id: PromiseId) -> Option<&Promise> {
-        self.promises.get(&id)
+        self.state.promises.get(&id)
     }
 
     /// Returns the number of retained idempotency responses.
     pub fn idempotency_record_count(&self) -> usize {
-        self.idempotency_records.len()
+        self.state.idempotency_records.len()
     }
 
     /// Returns emitted events whose sequence is at least `from_sequence`.
@@ -130,9 +300,149 @@ impl Engine {
     /// transition may share its sequence and retain their emission order.
     pub fn watch_events(&self, from_sequence: SequenceNumber) -> &[Event] {
         let first = self
+            .state
             .events
             .partition_point(|event| event.sequence() < from_sequence);
-        &self.events[first..]
+        &self.state.events[first..]
+    }
+
+    /// Installs decoded authoritative effects without executing command admission.
+    pub(crate) fn install_transition(
+        &mut self,
+        transition: DurableTransition,
+    ) -> Result<(), InstallError> {
+        let next_revision = self
+            .publication_revision
+            .0
+            .checked_add(1)
+            .map(PublicationRevision)
+            .ok_or(InstallError::PublicationRevision)?;
+        if transition.command.client_id() != &transition.client_id
+            || transition.command.idempotency_key() != &transition.idempotency_key
+        {
+            return Err(InstallError::CommandIdentity);
+        }
+        if hash_operation(transition.command.operation()) != transition.command_hash {
+            return Err(InstallError::CommandHash);
+        }
+        let identity = (
+            transition.client_id.clone(),
+            transition.idempotency_key.clone(),
+        );
+        if self.state.idempotency_records.contains_key(&identity) {
+            return Err(InstallError::DuplicateIdempotencyIdentity);
+        }
+
+        let current_sequence = self.state.sequence;
+        if transition.final_sequence < current_sequence {
+            return Err(InstallError::Sequence);
+        }
+        if transition.events.is_empty() {
+            if transition.final_sequence != current_sequence {
+                return Err(InstallError::Sequence);
+            }
+        } else {
+            let mut previous = current_sequence;
+            for event in &transition.events {
+                let sequence = event.sequence();
+                if sequence < previous {
+                    return Err(InstallError::Sequence);
+                }
+                if sequence > previous {
+                    if previous.get().checked_add(1) != Some(sequence.get()) {
+                        return Err(InstallError::Sequence);
+                    }
+                    previous = sequence;
+                } else if previous == current_sequence {
+                    return Err(InstallError::Sequence);
+                }
+            }
+            if previous != transition.final_sequence {
+                return Err(InstallError::Sequence);
+            }
+        }
+
+        let mut candidate = self.state.clone();
+        candidate.slack_timelines.clear();
+        let mut previous_pool = None;
+        for pool in transition.resource_pools {
+            let id = pool.id();
+            if previous_pool.is_some_and(|previous| previous >= id) {
+                return Err(InstallError::EntityIdentity);
+            }
+            previous_pool = Some(id);
+            candidate.resource_pools.insert(id, pool);
+        }
+        let mut previous_promise = None;
+        for promise in transition.promises {
+            let id = promise.id();
+            if previous_promise.is_some_and(|previous| previous >= id)
+                || promise.created_sequence() > promise.updated_sequence()
+                || promise.updated_sequence() > transition.final_sequence
+            {
+                return Err(InstallError::DomainInvariant);
+            }
+            previous_promise = Some(id);
+            candidate.promises.insert(id, promise);
+        }
+        if candidate.promises.values().any(|promise| {
+            promise
+                .bundle()
+                .claims()
+                .iter()
+                .any(|claim| !candidate.resource_pools.contains_key(&claim.pool_id()))
+        }) {
+            return Err(InstallError::DomainInvariant);
+        }
+        for event in &transition.events {
+            let valid_identity = match event.data() {
+                EventData::ResourcePool { resource_pool_id } => {
+                    candidate.resource_pools.contains_key(resource_pool_id)
+                }
+                EventData::Promise { promise_id, .. } => {
+                    candidate.promises.contains_key(promise_id)
+                }
+                EventData::Deficit {
+                    resource_pool_id,
+                    affected_promise_ids,
+                    ..
+                } => {
+                    candidate.resource_pools.contains_key(resource_pool_id)
+                        && affected_promise_ids
+                            .iter()
+                            .all(|id| candidate.promises.contains_key(id))
+                }
+            };
+            if !valid_identity {
+                return Err(InstallError::EntityIdentity);
+            }
+        }
+        candidate.events.extend(transition.events);
+        candidate.sequence = transition.final_sequence;
+        candidate.idempotency_records.insert(
+            identity,
+            IdempotencyRecord::new(transition.command_hash, transition.response),
+        );
+        self.state = candidate;
+        self.publication_revision = next_revision;
+        Ok(())
+    }
+
+    /// Reconstructs every derived slack timeline from authoritative state.
+    pub(crate) fn rebuild_slack_timelines(&mut self) -> Result<(), InstallError> {
+        let active_promises: Vec<&Promise> = self.state.promises.values().collect();
+        let mut timelines = BTreeMap::new();
+        for (pool_id, pool) in &self.state.resource_pools {
+            let timeline = SlackTimeline::from_capacity_and_promises(
+                pool.capacity_curve(),
+                *pool_id,
+                &active_promises,
+            )
+            .map_err(|_| InstallError::Index(DomainError::IndexOverflow))?;
+            timelines.insert(*pool_id, timeline);
+        }
+        self.state.slack_timelines = timelines;
+        Ok(())
     }
 
     /// Applies one deterministic command at an authoritative timestamp.
@@ -151,24 +461,162 @@ impl Engine {
         now: Timestamp,
     ) -> Result<CommandResult, DomainError> {
         let command_hash = hash_operation(command.operation());
-        let idempotency_identity = (
+        let identity = (
             command.client_id().clone(),
             command.idempotency_key().clone(),
         );
-
-        if let Some(record) = self.idempotency_records.get(&idempotency_identity) {
+        if let Some(record) = self.state.idempotency_records.get(&identity) {
             if record.command_hash() != command_hash {
                 return Err(DomainError::IdempotencyConflict);
             }
             return record.response().clone();
         }
 
+        let next_revision = self
+            .publication_revision
+            .0
+            .checked_add(1)
+            .map(PublicationRevision)
+            .ok_or(DomainError::PublicationRevisionOverflow)?;
         let response = self.apply_once(command.into_operation(), now);
-        self.idempotency_records.insert(
-            idempotency_identity,
+        self.state.idempotency_records.insert(
+            identity,
             IdempotencyRecord::new(command_hash, response.clone()),
         );
+        self.publication_revision = next_revision;
         response
+    }
+
+    /// Prepares ordered commands against one candidate cloned from published state.
+    pub(crate) fn prepare_batch(
+        &self,
+        commands: Vec<(Command, Timestamp)>,
+    ) -> Result<PreparedBatch, PreparationError> {
+        if commands.is_empty() {
+            return Ok(PreparedBatch {
+                base_revision: self.publication_revision,
+                next_revision: self.publication_revision,
+                candidate: None,
+                responses: Vec::new(),
+                durable_items: Vec::new(),
+            });
+        }
+
+        let mut new_identities = BTreeMap::new();
+        for (command, _) in &commands {
+            let identity = (
+                command.client_id().clone(),
+                command.idempotency_key().clone(),
+            );
+            if !self.state.idempotency_records.contains_key(&identity) {
+                new_identities
+                    .entry(identity)
+                    .or_insert_with(|| hash_operation(command.operation()));
+            }
+        }
+        let revision_delta =
+            u128::try_from(new_identities.len()).map_err(|_| PreparationError::RevisionOverflow)?;
+        let next_revision = self
+            .publication_revision
+            .0
+            .checked_add(revision_delta)
+            .map(PublicationRevision)
+            .ok_or(PreparationError::RevisionOverflow)?;
+
+        let base = &self.state;
+        let mut candidate_engine = Self {
+            clock: Box::new(SystemClock),
+            state: base.clone(),
+            publication_revision: self.publication_revision,
+        };
+        let mut responses = Vec::with_capacity(commands.len());
+        let mut durable_items = Vec::with_capacity(new_identities.len());
+
+        for (command, timestamp) in commands {
+            let command_hash = hash_operation(command.operation());
+            let identity = (
+                command.client_id().clone(),
+                command.idempotency_key().clone(),
+            );
+            if let Some(record) = candidate_engine.state.idempotency_records.get(&identity) {
+                let response = if record.command_hash() == command_hash {
+                    record.response().clone()
+                } else {
+                    Err(DomainError::IdempotencyConflict)
+                };
+                responses.push(response);
+                continue;
+            }
+
+            let prior_event_count = candidate_engine.state.events.len();
+            let response = candidate_engine.apply_once(command.operation().clone(), timestamp);
+            candidate_engine.state.idempotency_records.insert(
+                identity,
+                IdempotencyRecord::new(command_hash, response.clone()),
+            );
+            let resource_pools = candidate_engine
+                .state
+                .resource_pools
+                .iter()
+                .filter(|(id, value)| base.resource_pools.get(id) != Some(*value))
+                .map(|(_, value)| value.clone())
+                .collect();
+            let promises = candidate_engine
+                .state
+                .promises
+                .iter()
+                .filter(|(id, value)| base.promises.get(id) != Some(*value))
+                .map(|(_, value)| value.clone())
+                .collect();
+            let events = candidate_engine.state.events[prior_event_count..].to_vec();
+            let transition = DurableTransition {
+                client_id: command.client_id().clone(),
+                idempotency_key: command.idempotency_key().clone(),
+                command,
+                command_hash,
+                response: response.clone(),
+                resource_pools,
+                promises,
+                events,
+                final_sequence: candidate_engine.state.sequence,
+            };
+            responses.push(response);
+            durable_items.push(TimestampedTransition {
+                timestamp,
+                transition,
+            });
+        }
+
+        Ok(PreparedBatch {
+            base_revision: self.publication_revision,
+            next_revision,
+            candidate: Some(candidate_engine.state),
+            responses,
+            durable_items,
+        })
+    }
+
+    /// Verifies that a prepared batch still targets the published revision.
+    pub(crate) fn can_publish(&self, prepared: &PreparedBatch) -> Result<(), PreparationError> {
+        if !prepared.durable_items.is_empty() && prepared.base_revision != self.publication_revision
+        {
+            return Err(PreparationError::StaleRevision {
+                expected: prepared.base_revision,
+                actual: self.publication_revision,
+            });
+        }
+        Ok(())
+    }
+
+    /// Publishes a preflighted batch without validation or arithmetic.
+    pub(crate) fn publish_batch(&mut self, prepared: PreparedBatch) -> Vec<CommandResponse> {
+        if !prepared.durable_items.is_empty()
+            && let Some(candidate) = prepared.candidate
+        {
+            self.state = candidate;
+            self.publication_revision = prepared.next_revision;
+        }
+        prepared.responses
     }
 
     fn apply_once(
@@ -275,7 +723,7 @@ impl Engine {
     /// Returns [`DomainError::SequenceOverflow`] when the current sequence is
     /// `u64::MAX`.
     pub(crate) fn next_sequence(&self) -> Result<SequenceNumber, DomainError> {
-        self.sequence.next()
+        self.state.sequence.next()
     }
 
     /// Expires every due hold in deterministic deadline-and-ID order.
@@ -289,6 +737,7 @@ impl Engine {
     /// or when a selected promise unexpectedly disappears.
     fn process_expirations(&mut self, now: Timestamp) -> Result<usize, DomainError> {
         let mut due_holds: Vec<(Timestamp, PromiseId)> = self
+            .state
             .promises
             .iter()
             .filter_map(|(promise_id, promise)| match promise.state() {
@@ -305,6 +754,7 @@ impl Engine {
         for (_, promise_id) in due_holds {
             let next_sequence = self.next_sequence()?;
             let mut expired_promise = self
+                .state
                 .promises
                 .get(&promise_id)
                 .ok_or(DomainError::PromiseNotFound)?
@@ -314,10 +764,10 @@ impl Engine {
             let adjusted_timelines = self.restored_timelines(expired_promise.bundle())?;
             let version = expired_promise.version();
 
-            self.promises.insert(promise_id, expired_promise);
-            self.slack_timelines.extend(adjusted_timelines);
-            self.sequence = next_sequence;
-            self.events.push(Event::new(
+            self.state.promises.insert(promise_id, expired_promise);
+            self.state.slack_timelines.extend(adjusted_timelines);
+            self.state.sequence = next_sequence;
+            self.state.events.push(Event::new(
                 next_sequence,
                 now,
                 EventKind::HoldExpired,
@@ -352,7 +802,7 @@ impl Engine {
     ) -> Result<ResourcePoolId, DomainError> {
         self.process_expirations(now)?;
 
-        if self.resource_pools.contains_key(&pool_id) {
+        if self.state.resource_pools.contains_key(&pool_id) {
             return Err(DomainError::ResourcePoolAlreadyExists);
         }
 
@@ -361,10 +811,10 @@ impl Engine {
             .map_err(|_| DomainError::IndexOverflow)?;
         let next_sequence = self.next_sequence()?;
 
-        self.resource_pools.insert(pool_id, pool);
-        self.slack_timelines.insert(pool_id, slack_timeline);
-        self.sequence = next_sequence;
-        self.events.push(Event::new(
+        self.state.resource_pools.insert(pool_id, pool);
+        self.state.slack_timelines.insert(pool_id, slack_timeline);
+        self.state.sequence = next_sequence;
+        self.state.events.push(Event::new(
             next_sequence,
             now,
             EventKind::ResourceCreated,
@@ -414,16 +864,18 @@ impl Engine {
         self.process_expirations(now)?;
 
         let mut revised_pool = self
+            .state
             .resource_pools
             .get(&pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?
             .clone();
         let current_timeline = self
+            .state
             .slack_timelines
             .get(&pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?;
         let previous_deficits = self.capacity_deficits(pool_id, current_timeline)?;
-        let active_promises: Vec<&Promise> = self.promises.values().collect();
+        let active_promises: Vec<&Promise> = self.state.promises.values().collect();
         let revised_timeline =
             SlackTimeline::from_capacity_and_promises(&capacity_curve, pool_id, &active_promises)
                 .map_err(|_| DomainError::IndexOverflow)?;
@@ -442,10 +894,10 @@ impl Engine {
         affected_promise_ids.sort_unstable();
         affected_promise_ids.dedup();
 
-        self.resource_pools.insert(pool_id, revised_pool);
-        self.slack_timelines.insert(pool_id, revised_timeline);
-        self.sequence = next_sequence;
-        self.events.push(Event::new(
+        self.state.resource_pools.insert(pool_id, revised_pool);
+        self.state.slack_timelines.insert(pool_id, revised_timeline);
+        self.state.sequence = next_sequence;
+        self.state.events.push(Event::new(
             next_sequence,
             now,
             EventKind::CapacityRevised,
@@ -458,7 +910,7 @@ impl Engine {
                 .iter()
                 .any(|current| current.interval.overlaps(&previous.interval))
             {
-                self.events.push(Event::new(
+                self.state.events.push(Event::new(
                     next_sequence,
                     now,
                     EventKind::DeficitResolved,
@@ -481,7 +933,7 @@ impl Engine {
             } else {
                 EventKind::DeficitCreated
             };
-            self.events.push(Event::new(
+            self.state.events.push(Event::new(
                 next_sequence,
                 now,
                 kind,
@@ -525,12 +977,13 @@ impl Engine {
         resource_pool_id: Option<ResourcePoolId>,
         time_range: Option<Interval>,
     ) -> Result<Vec<AtRiskPromise>, DomainError> {
-        if resource_pool_id.is_some_and(|pool_id| !self.resource_pools.contains_key(&pool_id)) {
+        if resource_pool_id.is_some_and(|pool_id| !self.state.resource_pools.contains_key(&pool_id))
+        {
             return Err(DomainError::ResourcePoolNotFound);
         }
 
         let mut promises_by_id: BTreeMap<PromiseId, Vec<CapacityDeficit>> = BTreeMap::new();
-        for (pool_id, timeline) in &self.slack_timelines {
+        for (pool_id, timeline) in &self.state.slack_timelines {
             if resource_pool_id.is_some_and(|requested| requested != *pool_id) {
                 continue;
             }
@@ -666,7 +1119,7 @@ impl Engine {
     ) -> Result<SlotOutcome, DomainError> {
         self.process_expirations(now)?;
 
-        if self.promises.contains_key(&promise_id) {
+        if self.state.promises.contains_key(&promise_id) {
             return Err(DomainError::PromiseAlreadyExists);
         }
         if expires_at <= now {
@@ -748,7 +1201,7 @@ impl Engine {
     ) -> Result<HoldOutcome, DomainError> {
         self.process_expirations(now)?;
 
-        if self.promises.contains_key(&promise_id) {
+        if self.state.promises.contains_key(&promise_id) {
             return Err(DomainError::PromiseAlreadyExists);
         }
         if expires_at <= now {
@@ -784,7 +1237,7 @@ impl Engine {
     ) -> Result<ChoiceOutcome, DomainError> {
         self.process_expirations(now)?;
 
-        if self.promises.contains_key(&promise_id) {
+        if self.state.promises.contains_key(&promise_id) {
             return Err(DomainError::PromiseAlreadyExists);
         }
         if expires_at <= now {
@@ -827,10 +1280,10 @@ impl Engine {
         let promise = Promise::with_id(promise_id, bundle, expires_at, now, next_sequence)?;
         let version = promise.version();
 
-        self.promises.insert(promise_id, promise);
-        self.slack_timelines.extend(timelines);
-        self.sequence = next_sequence;
-        self.events.push(Event::new(
+        self.state.promises.insert(promise_id, promise);
+        self.state.slack_timelines.extend(timelines);
+        self.state.sequence = next_sequence;
+        self.state.events.push(Event::new(
             next_sequence,
             now,
             EventKind::HoldCreated,
@@ -899,6 +1352,7 @@ impl Engine {
 
         let new_sequence = self.next_sequence()?;
         let promise = self
+            .state
             .promises
             .get_mut(&promise_id)
             .ok_or(DomainError::PromiseNotFound)?;
@@ -909,8 +1363,8 @@ impl Engine {
 
         let new_version = promise.commit(expected_version, now, new_sequence)?;
 
-        self.sequence = new_sequence;
-        self.events.push(Event::new(
+        self.state.sequence = new_sequence;
+        self.state.events.push(Event::new(
             new_sequence,
             now,
             EventKind::HoldCommitted,
@@ -957,6 +1411,7 @@ impl Engine {
 
         let new_sequence = self.next_sequence()?;
         let mut released_promise = self
+            .state
             .promises
             .get(&promise_id)
             .ok_or(DomainError::PromiseNotFound)?
@@ -969,10 +1424,10 @@ impl Engine {
         let new_version = released_promise.release(expected_version, now, new_sequence)?;
         let adjusted_timelines = self.restored_timelines(released_promise.bundle())?;
 
-        self.promises.insert(promise_id, released_promise);
-        self.slack_timelines.extend(adjusted_timelines);
-        self.sequence = new_sequence;
-        self.events.push(Event::new(
+        self.state.promises.insert(promise_id, released_promise);
+        self.state.slack_timelines.extend(adjusted_timelines);
+        self.state.sequence = new_sequence;
+        self.state.events.push(Event::new(
             new_sequence,
             now,
             EventKind::PromiseReleased,
@@ -1024,6 +1479,7 @@ impl Engine {
         self.process_expirations(now)?;
 
         let mut replaced_promise = self
+            .state
             .promises
             .get(&promise_id)
             .ok_or(DomainError::PromiseNotFound)?
@@ -1057,10 +1513,10 @@ impl Engine {
             };
         final_timelines.extend(adjusted_timelines);
 
-        self.promises.insert(promise_id, replaced_promise);
-        self.slack_timelines.extend(final_timelines);
-        self.sequence = next_sequence;
-        self.events.push(Event::new(
+        self.state.promises.insert(promise_id, replaced_promise);
+        self.state.slack_timelines.extend(final_timelines);
+        self.state.sequence = next_sequence;
+        self.state.events.push(Event::new(
             next_sequence,
             now,
             EventKind::PromiseReplaced,
@@ -1134,6 +1590,7 @@ impl Engine {
         candidate_claims: &[&Claim],
     ) -> Result<bool, DomainError> {
         let pool = self
+            .state
             .resource_pools
             .get(&pool_id)
             .ok_or(DomainError::ResourcePoolNotFound)?;
@@ -1153,7 +1610,7 @@ impl Engine {
             breakpoints.push(interval.end());
         }
 
-        for promise in self.promises.values() {
+        for promise in self.state.promises.values() {
             if !matches!(
                 promise.state(),
                 PromiseState::Held { .. } | PromiseState::Committed
@@ -1318,6 +1775,7 @@ impl Engine {
 
             if final_slack < minimum_allowed_slack {
                 let conflicting_promise_ids = self
+                    .state
                     .promises
                     .iter()
                     .filter_map(|(promise_id, promise)| {
@@ -1460,6 +1918,7 @@ impl Engine {
                 let interval = deficit.interval();
                 let quantity = deficit.amount();
                 let affected_promise_ids = self
+                    .state
                     .promises
                     .iter()
                     .filter_map(|(promise_id, promise)| {
@@ -1503,6 +1962,7 @@ impl Engine {
         let mut restored_timelines = BTreeMap::new();
         for (pool_id, claims) in claims_by_pool {
             let mut timeline = self
+                .state
                 .slack_timelines
                 .get(&pool_id)
                 .ok_or(DomainError::ResourcePoolNotFound)?
@@ -1565,8 +2025,8 @@ mod tests {
         let pool_id = pool.id();
         let timeline = SlackTimeline::from_capacity_curve(pool.capacity_curve())
             .expect("the slack timeline should be created");
-        engine.resource_pools.insert(pool_id, pool);
-        engine.slack_timelines.insert(pool_id, timeline);
+        engine.state.resource_pools.insert(pool_id, pool);
+        engine.state.slack_timelines.insert(pool_id, timeline);
         (engine, pool_id)
     }
 
@@ -1674,9 +2134,9 @@ mod tests {
         )
         .expect("the promise should be valid");
         let promise_id = promise.id();
-        engine.promises.insert(promise_id, promise);
-        engine.slack_timelines.extend(adjusted_timelines);
-        engine.sequence = SequenceNumber::new(sequence);
+        engine.state.promises.insert(promise_id, promise);
+        engine.state.slack_timelines.extend(adjusted_timelines);
+        engine.state.sequence = SequenceNumber::new(sequence);
         promise_id
     }
 
@@ -1842,8 +2302,8 @@ mod tests {
                 .is_some()
         );
         assert_eq!(engine.sequence(), sequence);
-        assert!(engine.promises.is_empty());
-        assert!(engine.events.is_empty());
+        assert!(engine.state.promises.is_empty());
+        assert!(engine.state.events.is_empty());
         assert_eq!(engine.slack_timeline(pool_id), Some(&slack));
     }
 
@@ -1877,7 +2337,10 @@ mod tests {
             Interval::new(8, 13).unwrap()
         );
         assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(10), Ok(0));
-        assert_eq!(engine.events.last().unwrap().kind(), EventKind::HoldCreated);
+        assert_eq!(
+            engine.state.events.last().unwrap().kind(),
+            EventKind::HoldCreated
+        );
     }
 
     #[test]
@@ -1912,7 +2375,12 @@ mod tests {
         );
         assert_eq!(engine.sequence().get(), 3);
         assert_eq!(
-            engine.events.iter().map(Event::kind).collect::<Vec<_>>(),
+            engine
+                .state
+                .events
+                .iter()
+                .map(Event::kind)
+                .collect::<Vec<_>>(),
             vec![EventKind::HoldExpired, EventKind::HoldCreated]
         );
     }
@@ -1933,15 +2401,15 @@ mod tests {
             .apply(command_with_key("slot", operation.clone()), NOW)
             .unwrap();
         let sequence = engine.sequence();
-        let event_count = engine.events.len();
+        let event_count = engine.state.events.len();
         let second = engine
             .apply(command_with_key("slot", operation), EXPIRES_AT)
             .unwrap();
 
         assert_eq!(first, second);
         assert_eq!(engine.sequence(), sequence);
-        assert_eq!(engine.events.len(), event_count);
-        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.state.events.len(), event_count);
+        assert_eq!(engine.state.promises.len(), 1);
     }
 
     #[test]
@@ -1987,8 +2455,8 @@ mod tests {
 
         assert_eq!(outcome, SlotOutcome::Unavailable { attempts: 3 });
         assert_eq!(engine.sequence(), sequence);
-        assert!(engine.promises.is_empty());
-        assert!(engine.events.is_empty());
+        assert!(engine.state.promises.is_empty());
+        assert!(engine.state.events.is_empty());
         assert_eq!(engine.slack_timeline(pool_id), Some(&slack));
     }
 
@@ -2141,15 +2609,15 @@ mod tests {
             .apply(command_with_key("hold-1", operation.clone()), NOW)
             .expect("the first hold should succeed");
         let sequence = engine.sequence();
-        let event_count = engine.events.len();
+        let event_count = engine.state.events.len();
         let second = engine
             .apply(command_with_key("hold-1", operation), EXPIRES_AT)
             .expect("the retry should return its cached success");
 
         assert_eq!(first, second);
         assert_eq!(engine.sequence(), sequence);
-        assert_eq!(engine.events.len(), event_count);
-        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.state.events.len(), event_count);
+        assert_eq!(engine.state.promises.len(), 1);
         assert_eq!(engine.idempotency_record_count(), 1);
     }
 
@@ -2178,7 +2646,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(original, retry);
-        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.state.promises.len(), 1);
         assert_eq!(engine.sequence().get(), 1);
     }
 
@@ -2213,7 +2681,7 @@ mod tests {
         );
         assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(1));
         assert_eq!(engine.sequence().get(), 1);
-        assert_eq!(engine.events.len(), 1);
+        assert_eq!(engine.state.events.len(), 1);
     }
 
     #[test]
@@ -2242,7 +2710,7 @@ mod tests {
                 ..
             })
         ));
-        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.state.promises.len(), 1);
         assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(3));
     }
 
@@ -2277,7 +2745,7 @@ mod tests {
         assert_eq!(conflicts[1].conflicts()[0].required_quantity(), 2);
         assert!(engine.promise(promise_id).is_none());
         assert_eq!(engine.sequence().get(), 0);
-        assert!(engine.events.is_empty());
+        assert!(engine.state.events.is_empty());
         assert_eq!(engine.slack_timeline(pool_id).unwrap().slack_at(0), Ok(0));
     }
 
@@ -2287,7 +2755,7 @@ mod tests {
         let second_pool_id =
             create_pool_with_capacity_curve(&mut engine, constant_capacity_curve(0));
         let baseline_sequence = engine.sequence().get();
-        let baseline_events = engine.events.len();
+        let baseline_events = engine.state.events.len();
         let promise_id = PromiseId::generate();
         let result = engine
             .apply(
@@ -2321,9 +2789,9 @@ mod tests {
             engine.slack_timeline(second_pool_id).unwrap().slack_at(0),
             Ok(0)
         );
-        assert_eq!(engine.promises.len(), 1);
+        assert_eq!(engine.state.promises.len(), 1);
         assert_eq!(engine.sequence().get(), baseline_sequence + 1);
-        assert_eq!(engine.events.len(), baseline_events + 1);
+        assert_eq!(engine.state.events.len(), baseline_events + 1);
     }
 
     #[test]
@@ -2339,14 +2807,14 @@ mod tests {
             .apply(command_with_key("hold-one-of", operation.clone()), NOW)
             .unwrap();
         let sequence = engine.sequence();
-        let event_count = engine.events.len();
+        let event_count = engine.state.events.len();
         let retry = engine
             .apply(command_with_key("hold-one-of", operation), EXPIRES_AT)
             .unwrap();
 
         assert_eq!(retry, first);
         assert_eq!(engine.sequence(), sequence);
-        assert_eq!(engine.events.len(), event_count);
+        assert_eq!(engine.state.events.len(), event_count);
         assert!(matches!(
             engine.promise(promise_id).unwrap().state(),
             PromiseState::Held { .. }
@@ -2382,11 +2850,11 @@ mod tests {
             PromiseState::Expired
         );
         assert_eq!(engine.sequence().get(), 3);
-        assert_eq!(engine.events.len(), 2);
-        assert_eq!(engine.events[0].kind(), EventKind::HoldExpired);
-        assert_eq!(engine.events[1].kind(), EventKind::HoldCreated);
-        assert_eq!(engine.events[0].sequence().get(), 2);
-        assert_eq!(engine.events[1].sequence().get(), 3);
+        assert_eq!(engine.state.events.len(), 2);
+        assert_eq!(engine.state.events[0].kind(), EventKind::HoldExpired);
+        assert_eq!(engine.state.events[1].kind(), EventKind::HoldCreated);
+        assert_eq!(engine.state.events[0].sequence().get(), 2);
+        assert_eq!(engine.state.events[1].sequence().get(), 3);
     }
 
     #[test]
@@ -2414,7 +2882,7 @@ mod tests {
         engine.apply(first, NOW).unwrap();
         engine.apply(second, NOW).unwrap();
 
-        assert_eq!(engine.promises.len(), 2);
+        assert_eq!(engine.state.promises.len(), 2);
         assert_eq!(engine.idempotency_record_count(), 2);
     }
 
@@ -2436,7 +2904,7 @@ mod tests {
             )
             .unwrap();
         let sequence = engine.sequence();
-        let event_count = engine.events.len();
+        let event_count = engine.state.events.len();
 
         let result = engine.apply(
             command_with_key(
@@ -2452,7 +2920,7 @@ mod tests {
 
         assert_eq!(result, Err(DomainError::IdempotencyConflict));
         assert_eq!(engine.sequence(), sequence);
-        assert_eq!(engine.events.len(), event_count);
+        assert_eq!(engine.state.events.len(), event_count);
     }
 
     #[test]
@@ -2675,7 +3143,7 @@ mod tests {
             )
             .unwrap();
 
-        let kinds: Vec<EventKind> = engine.events.iter().map(Event::kind).collect();
+        let kinds: Vec<EventKind> = engine.state.events.iter().map(Event::kind).collect();
         assert_eq!(
             kinds,
             vec![
@@ -2685,8 +3153,14 @@ mod tests {
                 EventKind::DeficitResolved,
             ]
         );
-        assert_eq!(engine.events[0].sequence(), engine.events[1].sequence());
-        assert_eq!(engine.events[2].sequence(), engine.events[3].sequence());
+        assert_eq!(
+            engine.state.events[0].sequence(),
+            engine.state.events[1].sequence()
+        );
+        assert_eq!(
+            engine.state.events[2].sequence(),
+            engine.state.events[3].sequence()
+        );
     }
 
     #[test]
@@ -2700,7 +3174,7 @@ mod tests {
         });
         engine.apply(first, NOW).unwrap();
         let sequence = engine.sequence();
-        let event_count = engine.events.len();
+        let event_count = engine.state.events.len();
 
         let result = engine.apply(
             command(CommandOperation::Hold {
@@ -2713,7 +3187,7 @@ mod tests {
 
         assert_eq!(result, Err(DomainError::PromiseAlreadyExists));
         assert_eq!(engine.sequence(), sequence);
-        assert_eq!(engine.events.len(), event_count);
+        assert_eq!(engine.state.events.len(), event_count);
     }
 
     #[test]
@@ -3719,8 +4193,8 @@ mod tests {
         let result = engine.hold_at(candidate, EXPIRES_AT, NOW);
 
         assert_eq!(result, Err(DomainError::ResourcePoolNotFound));
-        assert!(engine.promises.is_empty());
-        assert!(engine.slack_timelines.is_empty());
+        assert!(engine.state.promises.is_empty());
+        assert!(engine.state.slack_timelines.is_empty());
         assert_eq!(engine.sequence().get(), 0);
     }
 
@@ -3799,7 +4273,7 @@ mod tests {
         assert_eq!(conflicts[0].available_quantity(), MAX_QUANTITY);
         assert_eq!(conflicts[0].deficit_quantity(), 1);
         assert_eq!(engine.slack_timeline(pool_id), Some(&original_timeline));
-        assert!(engine.promises.is_empty());
+        assert!(engine.state.promises.is_empty());
         assert_eq!(engine.sequence().get(), 0);
     }
 
@@ -4010,7 +4484,7 @@ mod tests {
             conflicts[1].blocking_interval(),
             Interval::new(10, 20).unwrap()
         );
-        assert!(engine.promises.is_empty());
+        assert!(engine.state.promises.is_empty());
         assert_eq!(engine.sequence(), sequence_before);
     }
 

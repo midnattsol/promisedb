@@ -59,8 +59,8 @@ pub enum EventData {
 
 /// A stable, ordered audit record for one successful state transition.
 ///
-/// Commands, rather than events, are intended to be the future recovery input.
-/// Events therefore contain minimal audit data and no references into engine state.
+/// Durable prepared transitions, not commands or events alone, are the recovery input.
+/// Events contain exact audit facts but no references into engine state.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Event {
     sequence: SequenceNumber,
@@ -70,6 +70,50 @@ pub struct Event {
 }
 
 impl Event {
+    /// Restores an event after validating that its kind matches its payload.
+    pub(crate) fn restore(
+        sequence: SequenceNumber,
+        timestamp: Timestamp,
+        kind: EventKind,
+        data: EventData,
+    ) -> Option<Self> {
+        let valid = matches!(
+            (kind, &data),
+            (
+                EventKind::ResourceCreated | EventKind::CapacityRevised,
+                EventData::ResourcePool { .. }
+            ) | (
+                EventKind::HoldCreated
+                    | EventKind::HoldCommitted
+                    | EventKind::PromiseReleased
+                    | EventKind::PromiseReplaced
+                    | EventKind::HoldExpired,
+                EventData::Promise { .. }
+            ) | (
+                EventKind::DeficitCreated | EventKind::DeficitChanged | EventKind::DeficitResolved,
+                EventData::Deficit { .. }
+            )
+        );
+        if !valid || sequence.get() == 0 {
+            return None;
+        }
+        if let EventData::Deficit {
+            quantity,
+            affected_promise_ids,
+            ..
+        } = &data
+            && (*quantity == 0 || !affected_promise_ids.windows(2).all(|ids| ids[0] < ids[1]))
+        {
+            return None;
+        }
+        Some(Self {
+            sequence,
+            timestamp,
+            kind,
+            data,
+        })
+    }
+
     pub(crate) fn new(
         sequence: SequenceNumber,
         timestamp: Timestamp,

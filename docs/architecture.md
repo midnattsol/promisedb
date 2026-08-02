@@ -1,6 +1,6 @@
 # Architecture
 
-PromiseDB is currently a single-process, in-memory state machine. The design separates authoritative domain state from reconstructible indexes.
+PromiseDB is currently a single-process durable state machine with a synchronous WAL coordinator. The design separates authoritative domain state from reconstructible indexes.
 
 ## Components
 
@@ -8,7 +8,8 @@ PromiseDB is currently a single-process, in-memory state machine. The design sep
 src/
 ├── domain.rs and domain/  validated values and promise lifecycle
 ├── clock.rs               command timestamp source
-├── engine.rs              authoritative state and serialized transitions
+├── engine.rs              authoritative state and prepared transitions
+├── storage/               durable coordinator, WAL framing/codecs, and recovery
 ├── index/                 reconstructible hot-path indexes
 ├── lib.rs                 library module tree
 └── main.rs                executable validation flow
@@ -20,31 +21,42 @@ The domain owns structural invariants for intervals, fixed-point units, claims, 
 
 ### Command boundary
 
-The control API generates entity IDs, resolves external names, and wraps every mutation with a `ClientId` and `IdempotencyKey`. It then submits a deterministic `CommandOperation` through `Engine::apply(command, now)`. The explicit timestamp is selected outside the state machine and reused during replay.
+The control API generates entity IDs, resolves external names, and wraps every mutation with a `ClientId` and `IdempotencyKey`. It then submits a deterministic `CommandOperation` through `Engine::apply(command, now)`. The explicit timestamp is selected outside the state machine. Commands are retained in durable transitions for audit, but recovery never executes them.
 
 Before dispatch, the engine hashes the normalized operation with BLAKE3 and looks up `(ClientId, IdempotencyKey)` in a deterministic map. Exact retries return the cached response immediately; conflicting payloads are rejected. The map stores a fixed-size command digest and complete response, and is authoritative state required by snapshots and recovery.
 
-Commands are intended to be the future WAL recovery input. Stable events are derived audit facts exposed by `watch_events(from_sequence)`. One requested command may first emit multiple expiration events; each successful state transition owns one sequence, while multiple audit events describing one capacity revision may share that transition sequence.
+Versioned durable transitions are the recovery input. Stable events are exact audit facts exposed by `watch_events(from_sequence)`, but are not sufficient recovery records by themselves. One requested command may first emit multiple expiration events; each successful domain transition owns one sequence, while multiple audit events describing one capacity revision may share that transition sequence.
 
 Queries such as `explain_unavailable`, `list_at_risk`, and `find_first_slot` are pure current-state reads. Deadline processing occurs before mutating commands or through `ProcessExpirations`. `find_first_slot` is advisory; `HoldFirstSlot` performs the same deterministic candidate search inside the authoritative mutation boundary.
 
 ### Engine
 
-`Engine` owns resource pools, promises, ordered audit events, the global sequence number, and one derived `SlackTimeline` per pool. Convenience operations read the injected clock once and delegate to deterministic `*_at` transitions; the durable command boundary receives `now` explicitly.
+`Engine` separates its clock from cloneable `EngineState`, which owns resource pools, promises, ordered audit events, idempotency records, the global sequence number, and one derived `SlackTimeline` per pool. A separate publication revision detects stale prepared candidates even when a command emits no domain sequence. Convenience operations read the injected clock once and delegate to deterministic `*_at` transitions; the durable command boundary receives `now` explicitly.
+
+The direct in-memory command path avoids a complete state clone:
 
 ```text
-public operation
-→ read clock once
-→ deterministic transition with explicit now
-→ process due expirations
-→ validate the complete operation
-→ prepare affected timeline copies
-→ calculate the next sequence
-→ publish authoritative state and prepared indexes
-→ publish the sequence and result
+Engine::apply
+→ idempotency lookup
+→ checked next publication revision
+→ deterministic transition on published state
+→ cache exact response
+→ assign the preflighted revision
 ```
 
-A rejected operation does not consume its own sequence. Expirations successfully processed before that rejection remain committed.
+The durable path isolates candidate effects:
+
+```text
+Engine::prepare_batch
+→ pre-scan idempotency identities and checked next publication revision
+→ clone EngineState once and transition commands sequentially
+→ derive timestamped stable authoritative after-values
+→ Engine::can_publish preflight
+→ persist all durable items as one group
+→ infallibly publish candidate with its prepared next revision
+```
+
+A rejected operation does not consume its own domain sequence. Expirations successfully processed before that rejection remain in the prepared transition. Every first-seen command still advances publication revision and persists one transition because its exact response and idempotency record are authoritative.
 
 ### Indexes
 
@@ -74,19 +86,21 @@ promises and their bundles
 promise states and versions
 idempotency command hashes and cached responses
 global sequence number
+publication revision (runtime concurrency guard)
 ```
 
 Temporal usage and slack are reconstructible from that state.
 
 ## Storage boundary
 
-Durable storage is not implemented yet. The intended ordering is:
+`storage::Database<B>` owns the engine and WAL backend and exposes no mutable bypass. Its crate-private prepare/publish boundary leaves published state untouched, preflights revision and record-sequence exhaustion, and yields a runtime candidate plus timestamped codec-stable transitions. Batch preparation clones `EngineState` once and executes commands sequentially; v1 may encode cumulative authoritative after-values relative to the original batch base, trading larger later records for avoiding per-command state clones. Storage ordering is:
 
 ```text
-validate deterministic transition
-→ append durable record
-→ satisfy configured flush policy
-→ publish state and result
+prepare one candidate and ordered effects
+→ preflight publication and contiguous record sequences
+→ stream all first-seen payloads into directly framed records in one byte vector
+→ one append and selected flush/sync
+→ infallibly publish the preflighted candidate
 ```
 
-Snapshots may contain derived indexes for faster startup, but recovery must be possible from authoritative snapshot state plus later WAL records.
+Recovery scans strict WAL order, validates record and event timestamps, installs durable effects without admission, and rebuilds all `SlackTimeline` indexes once at the end. It returns the next record sequence and last valid byte offset. Generic recovery rejects partial tails and never repairs files. Directory segmentation, process locking, snapshot files, and locked final-tail truncation are the next file-layer substage.
