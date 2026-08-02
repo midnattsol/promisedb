@@ -10,7 +10,7 @@ mod error;
 mod file;
 pub mod record;
 pub mod recovery;
-pub(crate) mod transition_codec;
+pub(crate) mod transition;
 
 pub use backend::{Durability, FileWal, MemoryWal, WalBackend, persist};
 pub use codec::{COMMAND_FORMAT_VERSION, decode_command, encode_command};

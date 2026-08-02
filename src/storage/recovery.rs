@@ -9,7 +9,7 @@ use crate::engine::{Engine, InstallError};
 
 use super::StorageError;
 use super::record::{Record, RecordLimits, RecordReader, RecordSequence};
-use super::transition_codec::decode_transition;
+use super::transition::decode_transition;
 
 /// Public, storage-safe classification of an effect-install failure.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -323,7 +323,7 @@ mod tests {
     use crate::domain::{CapacityCurve, ResourcePoolId, Unit};
     use crate::storage::RecordCorruption;
     use crate::storage::record::encode;
-    use crate::storage::transition_codec::encode_transition;
+    use crate::storage::transition::encode_transition;
 
     fn bytes(sequence: u64, payload: &[u8]) -> Vec<u8> {
         encode(

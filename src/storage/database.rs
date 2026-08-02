@@ -13,7 +13,7 @@ use super::StorageError;
 use super::backend::{Durability, WalBackend, persist};
 use super::record::{RecordLimits, RecordSequence, encode_payload_into};
 use super::recovery::{RecoveryError, RecoveryOutcome, recover_engine};
-use super::transition_codec::encode_transition_into;
+use super::transition::encode_transition_into;
 
 /// One command paired with its authoritative state-machine timestamp.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -281,7 +281,7 @@ mod tests {
     use crate::storage::backend::MemoryWal;
     use crate::storage::record::{Record, encode};
     use crate::storage::recovery::{RecoveryError, recover_engine};
-    use crate::storage::transition_codec::encode_transition;
+    use crate::storage::transition::encode_transition;
 
     fn pool(byte: u8) -> ResourcePoolId {
         ResourcePoolId::from_bytes([byte; 16])

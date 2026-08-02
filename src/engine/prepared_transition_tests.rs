@@ -1,9 +1,7 @@
 use super::*;
 use crate::command::{CommandOperation, CommandResult};
 use crate::domain::{CapacitySegment, RelativeClaim};
-use crate::storage::transition_codec::{
-    decode_transition, encode_transition, encode_transition_into,
-};
+use crate::storage::transition::{decode_transition, encode_transition, encode_transition_into};
 
 fn pool(byte: u8) -> ResourcePoolId {
     ResourcePoolId::from_bytes([byte; 16])
@@ -357,9 +355,28 @@ fn complex_transitions() -> (Engine, Vec<DurableTransition>) {
 
 #[test]
 fn transition_codec_is_deterministic_exact_and_rejects_corruption() {
+    const PRE_REFACTOR_CREATE_TRANSITION: &[u8] = &[
+        1, 99, 0, 0, 0, 1, 14, 0, 0, 0, 112, 114, 101, 112, 97, 114, 101, 100, 45, 116, 101, 115,
+        116, 115, 6, 0, 0, 0, 99, 114, 101, 97, 116, 101, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1,
+        1, 1, 1, 4, 0, 0, 0, 112, 111, 111, 108, 5, 0, 0, 0, 117, 110, 105, 116, 115, 1, 0, 0, 0,
+        0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0, 0, 0, 0, 10, 0, 0, 0, 0,
+        0, 0, 0, 14, 0, 0, 0, 112, 114, 101, 112, 97, 114, 101, 100, 45, 116, 101, 115, 116, 115,
+        6, 0, 0, 0, 99, 114, 101, 97, 116, 101, 240, 255, 174, 140, 138, 192, 191, 74, 170, 122,
+        249, 202, 77, 102, 193, 255, 198, 78, 90, 102, 79, 225, 75, 139, 202, 108, 87, 219, 124,
+        112, 96, 118, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 1, 1, 1, 1,
+        1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 4, 0, 0, 0, 112, 111, 111, 108, 5, 0, 0, 0, 117, 110,
+        105, 116, 115, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 232, 3, 0, 0, 0,
+        0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        0, 0, 0, 0, 0, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 1, 0, 0, 0, 0, 0, 0,
+        0,
+    ];
+
     let (_, transitions) = complex_transitions();
-    for transition in transitions {
+    for (index, transition) in transitions.into_iter().enumerate() {
         let first = encode_transition(&transition).unwrap();
+        if index == 0 {
+            assert_eq!(first, PRE_REFACTOR_CREATE_TRANSITION);
+        }
         let second = encode_transition(&transition).unwrap();
         assert_eq!(first, second);
         let mut appended = vec![0xaa, 0xbb];
