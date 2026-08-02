@@ -53,7 +53,7 @@ The reader:
   offset; and
 - tolerates ordinary short reads and interrupted reads.
 
-`storage::recovery::recover` remains the generic opaque scanner. `recover_engine` starts at record one, while `recover_engine_with_expected` accepts an explicit sequence and preceding engine state for future snapshot anchors. Engine recovery decodes and installs authoritative after-values, exact events, final domain sequence, and persisted idempotency records without executing embedded commands. It verifies emitted event timestamps against record timestamps and rebuilds derived slack timelines once after clean EOF. Partial tails remain errors; `RecoveryError` exposes the last valid byte offset for a future locked file repair layer.
+`storage::recovery::recover` remains the generic opaque scanner. `recover_engine` starts at record one, while `recover_engine_with_expected` accepts an explicit sequence and preceding engine state for future snapshot anchors. `EngineRecovery::feed` extends the same strict global sequence across multiple readers; `finish` rebuilds derived indexes once after every segment. Recovery decodes and installs authoritative after-values, exact events, final domain sequence, and persisted idempotency records without executing embedded commands. Generic recovery never repairs input. The locked file layer alone may use `RecoveryError::last_valid_offset` to truncate a partial final active tail.
 
 Record, command, and transition payload versions are distinct. The command codec retains `StorageError::UnsupportedVersion`, transition payloads report `UnsupportedTransitionVersion`, and WAL framing reports `UnsupportedRecordVersion`.
 
@@ -76,4 +76,59 @@ First-seen commands produce one transition even for errors and unavailable outco
 
 `Database::apply_batch` preflights preparation and contiguous record sequences, then frames every durable item directly into one final group vector. Record framing reserves and backpatches each 32-byte header around a fallible append-only payload writer; transition encoding writes directly into that payload region, including its nested command length prefix. No per-transition payload or framed-record `Vec` is allocated. Framing errors roll the destination back to the current record start, preserving earlier group bytes, and no backend I/O occurs. The completed group uses one append and one selected flush/sync, then publishes infallibly. Empty and retry/conflict-only batches perform no I/O. Encoding and sequence failures do not poison. Any append, flush, or sync failure returns `Indeterminate`, leaves state unpublished, and poisons subsequent writes while reads remain available.
 
-This stage deliberately does not implement directory layout, segment rotation, process locking, snapshots, or automatic tail truncation. Those belong to the next file-layer substage, where repair can occur only while holding the database lock.
+## Locked file database
+
+`FileDatabase` is the specialized `Database<SegmentedWal>` production API. `create` requires a new database directory; `open` acquires an exclusive nonblocking operating-system lock on the stable `LOCK` file before inspecting or repairing any persistent state. The lock handle remains inside `SegmentedWal` for the coordinator lifetime. Lock contention returns `FileDatabaseError::AlreadyOpen`; the implementation does not use lockfile creation as lock semantics.
+
+The database directory is:
+
+```text
+database/
+├── LOCK
+├── MANIFEST
+└── wal/
+    ├── 00000000000000000001.wal
+    ├── 00000000000000000042.wal
+    └── ...
+```
+
+### Manifest version 1
+
+`MANIFEST` is exactly 64 canonical bytes:
+
+| Byte range | Field |
+| --- | --- |
+| `0..4` | ASCII `PDBM` |
+| `4` | manifest version `1` |
+| `5` | reserved zero |
+| `6..8` | little-endian header length `64` |
+| `8..24` | version-4 database UUID |
+| `24..28` | little-endian persisted maximum record length |
+| `28..32` | little-endian state-machine semantics version `1` |
+| `32..48` | reserved zero |
+| `48..64` | BLAKE3-128 over bytes `0..48` |
+
+Creation uses `MANIFEST.tmp → sync file → rename → sync database directory`. The UUID is generated once with the existing `uuid` crate. Opening validates exact length, magic, version, reserved bytes, checksum, UUID semantics, semantics version, and `RecordLimits`. The caller must request exactly the persisted record maximum; mismatch is structured. The default remains 64 MiB.
+
+### Segment header version 1
+
+Every segment has a canonical 20-decimal-digit filename derived from its first global record sequence and a separate fixed 64-byte header:
+
+| Byte range | Field |
+| --- | --- |
+| `0..4` | ASCII `PDBS` |
+| `4` | segment version `1` |
+| `5` | flags `0` |
+| `6..8` | little-endian header length `64` |
+| `8..24` | database UUID |
+| `24..32` | little-endian first global record sequence |
+| `32..48` | reserved zero |
+| `48..64` | BLAKE3-128 over bytes `0..48` |
+
+A successor is created as `*.wal.tmp → header sync → rename → wal/ directory sync`. Recognized segment temp files are removed only after locking. Segment headers never enter generic `RecordReader`; recovery seeks to physical offset 64 and reports segment paths plus physical offsets on failure.
+
+Opening requires canonical names, strictly ordered segment starts, matching manifest UUIDs, valid header checksums, and contiguous global records. It streams segments through one `EngineRecovery` and rebuilds indexes once. Only `PartialTail` in the final active segment is repaired, by truncating to `64 + last_valid_record_offset` and synchronizing the file. Partial tails in sealed segments, complete checksum/format corruption, sequence gaps, UUID mismatches, and header failures are fatal; recovery never resynchronizes. An empty final active segment is valid.
+
+`SegmentedWal` validates each complete append group and uses checked conversion and `u64` arithmetic for physical-length projection before any I/O. An unrepresentable segment length returns structured `StorageError::SegmentLengthOverflow` without writing or rotating. It rotates before append when a nonempty active segment plus the group would cross `segment_target`. The whole group enters one segment and remains one `WalBackend::append`; an oversized group is allowed on a fresh segment. The default target is 256 MiB and the minimum is one segment header plus one minimum record (112 bytes). The target is operational rather than persisted. `Sync` synchronizes the active file and is the default. `Flush` only flushes userspace state and is not crash durable.
+
+Snapshots, compaction/segment deletion, asynchronous I/O, and cross-host lock coordination are not implemented.

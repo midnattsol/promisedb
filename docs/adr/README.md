@@ -34,3 +34,4 @@ ADRs explain why a decision exists. Current behavior belongs in `docs/semantics.
 - [ADR-0009: Explicit fixed-point resource units](0009-explicit-fixed-point-units.md)
 - [ADR-0010: Prepared durable transitions](0010-prepared-durable-transitions.md)
 - [ADR-0011: Durable coordinator and synchronous group commit](0011-durable-coordinator-and-group-commit.md)
+- [ADR-0012: Locked segmented file WAL](0012-locked-segmented-file-wal.md)

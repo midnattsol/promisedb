@@ -182,12 +182,121 @@ pub fn recover<R: Read>(reader: R, limits: RecordLimits) -> Result<Vec<Record>, 
     Ok(records)
 }
 
+/// Incremental effect-only recovery state for one or more WAL byte streams.
+///
+/// Each call to [`Self::feed`] starts at physical offset zero in its supplied reader,
+/// but continues the global record sequence from preceding feeds. Derived indexes are
+/// rebuilt only by [`Self::finish`], after every stream has been accepted.
+pub struct EngineRecovery {
+    engine: Engine,
+    next_record_sequence: Option<RecordSequence>,
+}
+
+impl EngineRecovery {
+    /// Starts recovery at record one with an empty engine.
+    pub fn new() -> Self {
+        Self::with_expected(RecordSequence::FIRST, Engine::new())
+    }
+
+    /// Starts recovery at an explicit sequence over supplied snapshot state.
+    pub fn with_expected(expected_sequence: RecordSequence, engine: Engine) -> Self {
+        Self {
+            engine,
+            next_record_sequence: Some(expected_sequence),
+        }
+    }
+
+    /// Returns the next global record sequence expected from a feed.
+    pub fn next_record_sequence(&self) -> Option<RecordSequence> {
+        self.next_record_sequence
+    }
+
+    /// Decodes and installs one complete stream without rebuilding derived indexes.
+    ///
+    /// The returned offset is local to this reader. If an error is returned, effects
+    /// from complete records preceding the error remain accumulated, allowing a locked
+    /// file layer to repair only a final partial tail and then finish recovery.
+    pub fn feed<R: Read>(&mut self, reader: R, limits: RecordLimits) -> Result<u64, RecoveryError> {
+        let expected_sequence = self.next_record_sequence.ok_or(RecoveryError::Storage {
+            last_valid_offset: 0,
+            source: StorageError::CorruptWalRecord {
+                offset: 0,
+                reason: super::RecordCorruption::SequenceOverflow,
+            },
+        })?;
+        let mut reader = RecordReader::with_expected_sequence(reader, limits, expected_sequence);
+        loop {
+            let record_start = reader.offset();
+            let record = match reader.read_next() {
+                Ok(Some(record)) => record,
+                Ok(None) => break,
+                Err(source) => {
+                    self.next_record_sequence = reader.expected_sequence();
+                    return Err(RecoveryError::Storage {
+                        last_valid_offset: record_start,
+                        source,
+                    });
+                }
+            };
+            self.next_record_sequence = reader.expected_sequence();
+            let transition =
+                decode_transition(record.payload()).map_err(|source| RecoveryError::Storage {
+                    last_valid_offset: record_start,
+                    source,
+                })?;
+            for event in transition.events() {
+                if event.timestamp() != record.timestamp() {
+                    return Err(RecoveryError::TimestampMismatch {
+                        record_sequence: record.record_sequence(),
+                        record_timestamp: record.timestamp(),
+                        event_timestamp: event.timestamp(),
+                        last_valid_offset: record_start,
+                    });
+                }
+            }
+            self.engine
+                .install_transition(transition)
+                .map_err(|source| RecoveryError::Install {
+                    record_sequence: Some(record.record_sequence()),
+                    last_valid_offset: record_start,
+                    source: source.into(),
+                })?;
+        }
+        self.next_record_sequence = reader.expected_sequence();
+        Ok(reader.offset())
+    }
+
+    /// Rebuilds derived indexes once and returns recovered state.
+    pub fn finish(mut self, last_valid_offset: u64) -> Result<RecoveryOutcome, RecoveryError> {
+        self.engine
+            .rebuild_slack_timelines()
+            .map_err(|source| RecoveryError::Install {
+                record_sequence: None,
+                last_valid_offset,
+                source: source.into(),
+            })?;
+        Ok(RecoveryOutcome {
+            engine: self.engine,
+            next_record_sequence: self.next_record_sequence,
+            last_valid_offset,
+        })
+    }
+}
+
+impl Default for EngineRecovery {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 /// Recovers a new engine from a complete WAL beginning at record one.
 pub fn recover_engine<R: Read>(
     reader: R,
     limits: RecordLimits,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    recover_engine_with_expected(reader, limits, RecordSequence::FIRST, Engine::new())
+    let mut recovery = EngineRecovery::new();
+    let last_valid_offset = recovery.feed(reader, limits)?;
+    recovery.finish(last_valid_offset)
 }
 
 /// Recovers effects from an explicit sequence into supplied snapshot state.
@@ -198,59 +307,11 @@ pub fn recover_engine_with_expected<R: Read>(
     reader: R,
     limits: RecordLimits,
     expected_sequence: RecordSequence,
-    mut engine: Engine,
+    engine: Engine,
 ) -> Result<RecoveryOutcome, RecoveryError> {
-    let mut reader = RecordReader::with_expected_sequence(reader, limits, expected_sequence);
-    loop {
-        let record_start = reader.offset();
-        let record = match reader.read_next() {
-            Ok(Some(record)) => record,
-            Ok(None) => break,
-            Err(source) => {
-                return Err(RecoveryError::Storage {
-                    last_valid_offset: record_start,
-                    source,
-                });
-            }
-        };
-        let transition =
-            decode_transition(record.payload()).map_err(|source| RecoveryError::Storage {
-                last_valid_offset: record_start,
-                source,
-            })?;
-        for event in transition.events() {
-            if event.timestamp() != record.timestamp() {
-                return Err(RecoveryError::TimestampMismatch {
-                    record_sequence: record.record_sequence(),
-                    record_timestamp: record.timestamp(),
-                    event_timestamp: event.timestamp(),
-                    last_valid_offset: record_start,
-                });
-            }
-        }
-        engine
-            .install_transition(transition)
-            .map_err(|source| RecoveryError::Install {
-                record_sequence: Some(record.record_sequence()),
-                last_valid_offset: record_start,
-                source: source.into(),
-            })?;
-    }
-
-    let last_valid_offset = reader.offset();
-    let next_record_sequence = reader.expected_sequence();
-    engine
-        .rebuild_slack_timelines()
-        .map_err(|source| RecoveryError::Install {
-            record_sequence: None,
-            last_valid_offset,
-            source: source.into(),
-        })?;
-    Ok(RecoveryOutcome {
-        engine,
-        next_record_sequence,
-        last_valid_offset,
-    })
+    let mut recovery = EngineRecovery::with_expected(expected_sequence, engine);
+    let last_valid_offset = recovery.feed(reader, limits)?;
+    recovery.finish(last_valid_offset)
 }
 
 #[cfg(test)]

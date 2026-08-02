@@ -33,7 +33,7 @@ Recovery scans strict record order, decodes transitions, validates event timesta
 - Record sequence exhaustion is detected before I/O.
 - A poisoned process must be restarted and recovered before accepting writes.
 - Full recovery starts at record one; an explicit expected-sequence API supports future snapshot anchors.
-- Directory layout, segment rotation, process locking, and locked final-tail repair remain the next file-layer substage. Generic readers report repair metadata but never mutate files.
+- Directory layout, segment rotation, process locking, and locked final-tail repair are defined by [ADR-0012](0012-locked-segmented-file-wal.md). Generic readers still report repair metadata but never mutate files.
 
 ## Alternatives considered
 

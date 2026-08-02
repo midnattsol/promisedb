@@ -7,6 +7,7 @@ mod backend;
 mod codec;
 mod database;
 mod error;
+mod file;
 pub mod record;
 pub mod recovery;
 pub(crate) mod transition_codec;
@@ -17,11 +18,15 @@ pub use database::{
     Database, DatabaseError, DatabaseOptions, DatabasePreparationError, TimedCommand,
 };
 pub use error::{RecordCorruption, StorageError};
+pub use file::{
+    DEFAULT_SEGMENT_TARGET, FileDatabase, FileDatabaseError, FileDatabaseOptions,
+    MIN_SEGMENT_TARGET, ManifestError, SEGMENT_HEADER_LEN, SegmentHeaderError, SegmentedWal,
+};
 pub use record::{
     Record, RecordLimits, RecordPayloadWriter, RecordReader, RecordSequence,
     encode as encode_record, encode_into as encode_record_into, encode_payload_into,
 };
 pub use recovery::{
-    RecoveryError, RecoveryInstallError, RecoveryOutcome, recover, recover_engine,
+    EngineRecovery, RecoveryError, RecoveryInstallError, RecoveryOutcome, recover, recover_engine,
     recover_engine_with_expected,
 };

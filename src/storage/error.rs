@@ -119,6 +119,13 @@ pub enum StorageError {
         /// Invalid encoded or requested length.
         length: u64,
     },
+    /// An append cannot be represented in the active segment's `u64` physical length.
+    SegmentLengthOverflow {
+        /// Tracked physical length before the append.
+        current: u64,
+        /// Number of bytes requested by the append.
+        append: usize,
+    },
     /// A configured record limit is below 48, unaligned, or above the format ceiling.
     InvalidRecordLimit(u64),
     /// A record exceeds the configured total record-size limit.
@@ -177,6 +184,10 @@ impl Display for StorageError {
             Self::InvalidLength { field, length } => {
                 write!(formatter, "invalid length {length} for {field}")
             }
+            Self::SegmentLengthOverflow { current, append } => write!(
+                formatter,
+                "segment length overflow: cannot append {append} bytes to physical length {current}"
+            ),
             Self::InvalidRecordLimit(limit) => {
                 write!(formatter, "invalid maximum WAL record length {limit}")
             }

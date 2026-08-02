@@ -103,4 +103,8 @@ prepare one candidate and ordered effects
 → infallibly publish the preflighted candidate
 ```
 
-Recovery scans strict WAL order, validates record and event timestamps, installs durable effects without admission, and rebuilds all `SlackTimeline` indexes once at the end. It returns the next record sequence and last valid byte offset. Generic recovery rejects partial tails and never repairs files. Directory segmentation, process locking, snapshot files, and locked final-tail truncation are the next file-layer substage.
+`FileDatabase` specializes the coordinator as `Database<SegmentedWal>`. The segmented backend owns the stable `LOCK` file's exclusive operating-system lock, so directory inspection, recovery, repair, and appends all occur under one lifetime owner. A checksummed manifest binds the database UUID, state-machine semantics version, and maximum record length. Checksummed segment headers repeat the UUID and first global sequence outside the generic record stream.
+
+Recovery validates canonical segment names and headers, then feeds each segment's record body into one streaming `EngineRecovery`. Effects install without command admission and all `SlackTimeline` indexes rebuild once after the final segment. The only automatic mutation is truncation and synchronization of an incomplete record in the final active segment. Sealed partial tails and all complete corruption remain fatal. Segment creation and manifest creation use temp-file synchronization, rename, and parent-directory synchronization; group rotation never splits a coordinator append.
+
+Snapshots and segment compaction/deletion are not yet implemented.
